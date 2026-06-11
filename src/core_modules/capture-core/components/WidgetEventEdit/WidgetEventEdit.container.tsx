@@ -19,6 +19,8 @@ import { WidgetHeader } from './WidgetHeader';
 import { WidgetTwoEventWorkspace, WidgetTwoEventWorkspaceWrapperTypes } from '../WidgetTwoEventWorkspace';
 import { useProgramExpiryForUser, useEnrollmentEditEventPageMode, useAvailableProgramStages } from '../../hooks';
 import { useAuthorities } from '../../utils/authority/useAuthorities';
+// Vitalworks Pro — surfaces server-side ASSIGN_VALUE_FROM_EVENT_LOOKUP outcomes
+import { EventLookupAuditBanner } from '../EventLookupAuditBanner';
 
 const styles: Readonly<any> = {
     container: {
@@ -135,6 +137,7 @@ const WidgetEventEditPlain = ({
                     borderless
                 >
                     <div className={classes.form}>
+                        <EventLookupAuditBanner eventId={eventId} />
                         {currentPageMode === dataEntryKeys.VIEW ? (
                             <div
                                 className={classes.form}
