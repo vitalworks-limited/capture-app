@@ -16,10 +16,11 @@
  * recent assignment per DE), and tolerates the endpoint being absent
  * (older server build).
  */
-import React from 'react';
+import React, { useState } from 'react';
 import i18n from '@dhis2/d2-i18n';
 import { useDataQuery } from '@dhis2/app-runtime';
-import { NoticeBox } from '@dhis2/ui';
+import { NoticeBox, Button } from '@dhis2/ui';
+import { ConflictResolutionModal } from './ConflictResolutionModal';
 
 const auditQuery = {
     audit: {
@@ -74,11 +75,12 @@ function hasConflict(entries) {
     );
 }
 
-export const EventLookupAuditBanner = ({ eventId }) => {
-    const { loading, error, data } = useDataQuery(auditQuery, {
+export const EventLookupAuditBanner = ({ eventId, enrollmentId, programStageUid }) => {
+    const { loading, error, data, refetch } = useDataQuery(auditQuery, {
         variables: { eventId },
         lazy: !eventId,
     });
+    const [resolving, setResolving] = useState(null);
 
     if (!eventId || loading || error) return null;
     const entries = dedupeByTargetDe(data?.audit?.entries);
@@ -96,13 +98,44 @@ export const EventLookupAuditBanner = ({ eventId }) => {
                 {...(warning ? { warning: true } : { info: true })}
             >
                 <ul style={{ margin: 0, paddingInlineStart: 18 }}>
-                    {entries.map(e => (
-                        <li key={`${e.audit_uid || e.auditUid}-${e.target_de_uid || e.targetDataElementUid}`}>
-                            {formatEntry(e)}
-                        </li>
-                    ))}
+                    {entries.map(e => {
+                        const isConflict = e.status === 'CONFLICT_BLOCKED' || e.conflict_detected === true;
+                        const actionUid = e.program_rule_action_uid || e.programRuleActionUid;
+                        return (
+                            <li key={`${e.audit_uid || e.auditUid}-${e.target_de_uid || e.targetDataElementUid}`}>
+                                {formatEntry(e)}
+                                {isConflict && actionUid && (
+                                    <span style={{ marginLeft: 8 }}>
+                                        <Button
+                                            small
+                                            secondary
+                                            onClick={() => setResolving({
+                                                actionUid,
+                                                targetDeUid: e.target_de_uid || e.targetDataElementUid,
+                                            })}
+                                        >
+                                            {i18n.t('Resolve…')}
+                                        </Button>
+                                    </span>
+                                )}
+                            </li>
+                        );
+                    })}
                 </ul>
             </NoticeBox>
+            <ConflictResolutionModal
+                open={!!resolving}
+                onClose={() => setResolving(null)}
+                onResolved={() => {
+                    setResolving(null);
+                    if (typeof refetch === 'function') refetch();
+                }}
+                programRuleActionUid={resolving?.actionUid}
+                eventId={eventId}
+                enrollmentId={enrollmentId}
+                programStageUid={programStageUid}
+                targetDataElementUid={resolving?.targetDeUid}
+            />
         </div>
     );
 };

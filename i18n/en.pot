@@ -5,8 +5,8 @@ msgstr ""
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1)\n"
-"POT-Creation-Date: 2026-06-07T10:51:19.665Z\n"
-"PO-Revision-Date: 2026-06-07T10:51:19.666Z\n"
+"POT-Creation-Date: 2026-06-11T12:00:09.388Z\n"
+"PO-Revision-Date: 2026-06-11T12:00:09.389Z\n"
 
 msgid "The application could not be loaded."
 msgstr "The application could not be loaded."
@@ -450,6 +450,48 @@ msgstr ""
 "This event has unsaved changes. Leaving this page without saving will lose "
 "these changes. Are you sure you want to discard unsaved changes?"
 
+msgid "Failed to load candidates"
+msgstr "Failed to load candidates"
+
+msgid "Failed to load action config"
+msgstr "Failed to load action config"
+
+msgid "Failed to write the chosen value"
+msgstr "Failed to write the chosen value"
+
+msgid "Resolve lookup conflict"
+msgstr "Resolve lookup conflict"
+
+msgid "Error"
+msgstr "Error"
+
+msgid "No candidates"
+msgstr "No candidates"
+
+msgid "No candidate events were returned by the server."
+msgstr "No candidate events were returned by the server."
+
+msgid "Event {{event}} · stage {{stage}} · {{when}}"
+msgstr "Event {{event}} · stage {{stage}} · {{when}}"
+
+msgid "Use this value"
+msgstr "Use this value"
+
+msgid "Field {{target}} auto-filled with {{value}} from event {{source}} ({{when}})"
+msgstr "Field {{target}} auto-filled with {{value}} from event {{source}} ({{when}})"
+
+msgid "Field {{target}} lookup ran but found no source value ({{when}})"
+msgstr "Field {{target}} lookup ran but found no source value ({{when}})"
+
+msgid "Lookup conflict on this event"
+msgstr "Lookup conflict on this event"
+
+msgid "Values auto-filled from other events"
+msgstr "Values auto-filled from other events"
+
+msgid "Resolve…"
+msgstr "Resolve…"
+
 msgid "No events to display"
 msgstr "No events to display"
 
@@ -620,6 +662,18 @@ msgstr "URL"
 
 msgid "Icon for {{field}}"
 msgstr "Icon for {{field}}"
+
+msgid "Reveal"
+msgstr "Reveal"
+
+msgid "Reveal (no authority)"
+msgstr "Reveal (no authority)"
+
+msgid "Hide"
+msgstr "Hide"
+
+msgid "Reason for revealing this value"
+msgstr "Reason for revealing this value"
 
 msgid "start typing to search"
 msgstr "start typing to search"
@@ -1443,6 +1497,15 @@ msgstr "Source access expires"
 msgid "Data that will move"
 msgstr "Data that will move"
 
+msgid "Validation summary"
+msgstr "Validation summary"
+
+msgid "Show details"
+msgstr "Show details"
+
+msgid "Hide details"
+msgstr "Hide details"
+
 msgid "Assigned to"
 msgstr "Assigned to"
 
@@ -1639,9 +1702,6 @@ msgstr "Write a note about this enrollment"
 
 msgid "This enrollment doesn't have any notes"
 msgstr "This enrollment doesn't have any notes"
-
-msgid "Error"
-msgstr "Error"
 
 msgid "Warning"
 msgstr "Warning"
@@ -1929,9 +1989,6 @@ msgstr "Stages and Events"
 
 msgid "Audit log"
 msgstr "Audit log"
-
-msgid "Hide"
-msgstr "Hide"
 
 msgid "Show"
 msgstr "Show"

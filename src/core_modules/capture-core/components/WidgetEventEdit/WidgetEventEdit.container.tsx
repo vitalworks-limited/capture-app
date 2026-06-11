@@ -137,7 +137,11 @@ const WidgetEventEditPlain = ({
                     borderless
                 >
                     <div className={classes.form}>
-                        <EventLookupAuditBanner eventId={eventId} />
+                        <EventLookupAuditBanner
+                            eventId={eventId}
+                            enrollmentId={enrollmentId}
+                            programStageUid={stageId}
+                        />
                         {currentPageMode === dataEntryKeys.VIEW ? (
                             <div
                                 className={classes.form}
