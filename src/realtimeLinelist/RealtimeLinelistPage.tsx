@@ -8,12 +8,13 @@
  * tables to refresh.
  *
  * Layout:
- *   - Capture scope-selector TopBar (program / org-unit / category) so
- *     the user can re-pick context without leaving the page
- *   - ProtectedDataNotice banner when keyProtectedFieldsEnabled = true
- *   - Stats tiles, search input, refresh controls
- *   - Server-filtered table; sensitive (isProtected) attributes are
- *     masked for users without F_VIEW_PROTECTED_DATA / ALL.
+ *   - Capture scope-selector TopBar (program / org-unit / category)
+ *   - Full-bleed VW Pro themed page with search, column manager,
+ *     paginated table, and a right-side detail drawer showing the
+ *     selected TEI's enrollments + events without leaving the list.
+ *   - Sensitive (isProtected) attributes are masked (••••) for users
+ *     without F_VIEW_PROTECTED_DATA / ALL; a small shield-lock icon
+ *     replaces the previous verbose banner.
  *
  * Mounted at hash route #/linelist?programId=…&orgUnitId=… and reachable
  * via the "Live records" button on the MainPage TopBar.
@@ -25,11 +26,51 @@ import { useLocationQuery } from 'capture-core/utils/routing';
 import { TopBar } from 'capture-core/components/Pages/MainPage/TopBar';
 
 const POLL_MS = 10_000;
-const PAGE_SIZE = 50;
+const DEFAULT_PAGE_SIZE = 50;
 const F_VIEW_PROTECTED_DATA = 'F_VIEW_PROTECTED_DATA';
 
+// VW Pro design tokens
+const T = {
+    brand: '#1F4E79',
+    brandSoft: '#E6EEF6',
+    surface: '#FFFFFF',
+    bg: '#F7F8FA',
+    bgAlt: '#F3F4F6',
+    border: '#E5E7EB',
+    borderStrong: '#D1D5DB',
+    text: '#1F2937',
+    textMuted: '#6B7280',
+    textInverse: '#FFFFFF',
+    success: '#166534',
+    successSoft: '#DCFCE7',
+    info: '#1E40AF',
+    infoSoft: '#DBEAFE',
+    danger: '#991B1B',
+    dangerSoft: '#FEE2E2',
+    warn: '#92400E',
+    warnSoft: '#FEF3C7',
+    radius: 8,
+    radiusSm: 4,
+    shadow: '0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(15,23,42,0.04)',
+} as const;
+
 type Attribute = { attribute: string; displayName?: string; value: string };
-type Enrollment = { enrollment: string; status: string; enrolledAt: string; occurredAt?: string };
+type Enrollment = {
+    enrollment: string;
+    program?: string;
+    status: string;
+    enrolledAt: string;
+    occurredAt?: string;
+    events?: TrackerEvent[];
+};
+type TrackerEvent = {
+    event: string;
+    programStage?: string;
+    status?: string;
+    occurredAt?: string;
+    createdAt?: string;
+    dataValues?: Array<{ dataElement: string; value: string }>;
+};
 type TEI = {
     trackedEntity: string;
     trackedEntityType?: string;
@@ -39,7 +80,7 @@ type TEI = {
     attributes?: Attribute[];
     enrollments?: Enrollment[];
 };
-type Event = {
+type EventRow = {
     event: string;
     program?: string;
     programStage?: string;
@@ -52,15 +93,21 @@ type Event = {
 };
 type FetchedPayload = {
     kind: 'tracker' | 'event';
-    rows: Array<TEI | Event>;
+    rows: Array<TEI | EventRow>;
     total?: number;
+    pageCount?: number;
+    page: number;
+    pageSize: number;
     fetchedAt: Date;
 };
 type AttrMeta = {
     id: string;
     displayName: string;
     isProtected: boolean;
+    displayInList: boolean;
+    searchable: boolean;
 };
+type StageMeta = { id: string; displayName: string };
 
 const fmtDate = (iso?: string) => {
     if (!iso) return '';
@@ -86,149 +133,466 @@ const useDebounced = <T,>(value: T, ms = 350) => {
     return debounced;
 };
 
-const C = {
-    page: { padding: 16, maxWidth: 1400, margin: '0 auto', fontFamily: 'inherit' } as React.CSSProperties,
+const C: Record<string, React.CSSProperties> = {
+    shell: {
+        background: T.bg,
+        minHeight: 'calc(100vh - 96px)',
+        padding: '16px 20px 24px',
+        boxSizing: 'border-box',
+        fontFamily: 'inherit',
+        color: T.text,
+    },
     headerRow: {
         display: 'flex',
-        alignItems: 'center',
+        alignItems: 'flex-end',
         justifyContent: 'space-between',
+        gap: 12,
+        marginBottom: 14,
+        flexWrap: 'wrap',
+    },
+    headerLeft: { display: 'flex', alignItems: 'center', gap: 10 },
+    title: { fontSize: 22, fontWeight: 700, color: T.text, margin: 0, letterSpacing: '-0.01em' },
+    subtitle: { fontSize: 13, color: T.textMuted, marginTop: 2 },
+    body: { display: 'flex', gap: 16, alignItems: 'stretch' },
+    main: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' },
+    drawer: {
+        width: 380,
+        background: T.surface,
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radius,
+        boxShadow: T.shadow,
+        padding: 16,
+        position: 'sticky',
+        top: 16,
+        alignSelf: 'flex-start',
+        maxHeight: 'calc(100vh - 140px)',
+        overflowY: 'auto',
+    },
+    statsRow: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+        gap: 10,
         marginBottom: 12,
-        flexWrap: 'wrap' as const,
-        gap: 8,
-    } as React.CSSProperties,
-    title: { fontSize: 20, fontWeight: 600, color: '#1F2937', margin: 0 } as React.CSSProperties,
-    subtitle: { fontSize: 13, color: '#6B7280', marginTop: 2 } as React.CSSProperties,
+    },
+    tile: {
+        background: T.surface,
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radius,
+        padding: '10px 12px',
+        fontSize: 12,
+        color: T.textMuted,
+        fontWeight: 500,
+    },
+    tileValue: { fontWeight: 700, fontSize: 16, color: T.text, marginTop: 4 },
     controlsRow: {
         display: 'flex',
         gap: 8,
         alignItems: 'center',
         marginBottom: 12,
-        flexWrap: 'wrap' as const,
-    } as React.CSSProperties,
-    statsRow: { display: 'flex', gap: 12, marginBottom: 12, flexWrap: 'wrap' as const } as React.CSSProperties,
-    tile: {
-        background: '#F3F4F6',
-        border: '1px solid #E5E7EB',
-        borderRadius: 6,
-        padding: '8px 12px',
-        fontSize: 12,
-        color: '#374151',
-        minWidth: 120,
-    } as React.CSSProperties,
-    tileValue: { fontWeight: 600, fontSize: 15, color: '#111827', marginTop: 2 } as React.CSSProperties,
-    btn: {
-        background: '#fff',
-        color: '#1F4E79',
-        border: '1px solid #D1D5DB',
-        borderRadius: 4,
-        padding: '6px 12px',
-        fontSize: 13,
-        cursor: 'pointer',
-        fontWeight: 500,
-    } as React.CSSProperties,
-    btnPrimary: {
-        background: '#1F4E79',
-        color: '#fff',
-        border: '1px solid #1F4E79',
-        borderRadius: 4,
-        padding: '6px 12px',
-        fontSize: 13,
-        cursor: 'pointer',
-        fontWeight: 500,
-    } as React.CSSProperties,
+        flexWrap: 'wrap',
+    },
     search: {
         flex: 1,
-        minWidth: 220,
-        padding: '6px 10px',
+        minWidth: 240,
+        padding: '8px 12px',
         fontSize: 13,
-        border: '1px solid #D1D5DB',
-        borderRadius: 4,
-        background: '#fff',
-        color: '#1F2937',
-    } as React.CSSProperties,
-    notice: {
-        padding: '12px 14px',
-        background: '#FFFBEB',
-        border: '1px solid #FCD34D',
-        color: '#92400E',
-        borderRadius: 4,
-        marginBottom: 12,
+        border: `1px solid ${T.borderStrong}`,
+        borderRadius: T.radiusSm,
+        background: T.surface,
+        color: T.text,
+        outline: 'none',
+    },
+    btn: {
+        background: T.surface,
+        color: T.brand,
+        border: `1px solid ${T.borderStrong}`,
+        borderRadius: T.radiusSm,
+        padding: '7px 12px',
         fontSize: 13,
-    } as React.CSSProperties,
-    error: {
-        padding: '12px 14px',
-        background: '#FEF2F2',
-        border: '1px solid #FCA5A5',
-        color: '#991B1B',
-        borderRadius: 4,
-        marginBottom: 12,
+        cursor: 'pointer',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+    },
+    btnPrimary: {
+        background: T.brand,
+        color: T.textInverse,
+        border: `1px solid ${T.brand}`,
+        borderRadius: T.radiusSm,
+        padding: '7px 14px',
         fontSize: 13,
-    } as React.CSSProperties,
-    tableWrap: {
-        background: '#fff',
-        border: '1px solid #E5E7EB',
-        borderRadius: 6,
-        overflow: 'auto',
-    } as React.CSSProperties,
-    table: { width: '100%', borderCollapse: 'collapse' as const } as React.CSSProperties,
-    th: {
-        padding: '10px 12px',
-        textAlign: 'left' as const,
+        cursor: 'pointer',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+    },
+    iconBtn: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: T.surface,
+        color: T.brand,
+        border: `1px solid ${T.borderStrong}`,
+        borderRadius: T.radiusSm,
+        width: 34,
+        height: 34,
+        cursor: 'pointer',
+    },
+    pillProtected: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '4px 10px',
+        borderRadius: 999,
         fontSize: 12,
         fontWeight: 600,
-        background: '#F9FAFB',
-        borderBottom: '1px solid #E5E7EB',
-        color: '#4B5563',
-        textTransform: 'uppercase' as const,
-        letterSpacing: '0.04em',
-    } as React.CSSProperties,
+        background: T.warnSoft,
+        color: T.warn,
+    },
+    tableWrap: {
+        background: T.surface,
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radius,
+        boxShadow: T.shadow,
+        overflow: 'hidden',
+        marginBottom: 12,
+    },
+    tableScroll: { overflow: 'auto' },
+    table: { width: '100%', borderCollapse: 'separate', borderSpacing: 0 },
+    th: {
+        padding: '10px 14px',
+        textAlign: 'left',
+        fontSize: 11,
+        fontWeight: 700,
+        background: T.bgAlt,
+        borderBottom: `1px solid ${T.border}`,
+        color: T.textMuted,
+        textTransform: 'uppercase',
+        letterSpacing: '0.06em',
+        position: 'sticky',
+        top: 0,
+    },
     td: {
-        padding: '10px 12px',
-        borderBottom: '1px solid #F3F4F6',
+        padding: '10px 14px',
+        borderBottom: `1px solid ${T.bgAlt}`,
         fontSize: 13,
-        color: '#1F2937',
-    } as React.CSSProperties,
-    mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 } as React.CSSProperties,
-    muted: { color: '#6B7280', fontSize: 12 } as React.CSSProperties,
-    masked: {
-        display: 'inline-block',
-        padding: '2px 6px',
-        borderRadius: 3,
-        background: '#F3F4F6',
-        color: '#6B7280',
+        color: T.text,
+    },
+    tdSelected: { background: T.brandSoft },
+    mono: {
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: 12,
-        letterSpacing: '0.1em',
-    } as React.CSSProperties,
+        color: T.textMuted,
+    },
+    muted: { color: T.textMuted, fontSize: 12 },
+    masked: {
+        display: 'inline-block',
+        padding: '2px 8px',
+        borderRadius: 999,
+        background: T.bgAlt,
+        color: T.textMuted,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 12,
+        letterSpacing: '0.15em',
+    },
     pill: {
         display: 'inline-block',
         padding: '2px 8px',
         borderRadius: 999,
         fontSize: 11,
-        fontWeight: 600,
-    } as React.CSSProperties,
-    empty: { padding: 24, textAlign: 'center' as const, color: '#6B7280' } as React.CSSProperties,
+        fontWeight: 700,
+    },
+    empty: { padding: 32, textAlign: 'center', color: T.textMuted, fontSize: 14 },
+    pagerRow: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '10px 14px',
+        background: T.bgAlt,
+        borderTop: `1px solid ${T.border}`,
+        fontSize: 13,
+        color: T.text,
+        gap: 12,
+        flexWrap: 'wrap',
+    },
+    pagerBtns: { display: 'flex', gap: 6, alignItems: 'center' },
+    pagerInfo: { color: T.textMuted },
+    pagerSelect: {
+        padding: '4px 8px',
+        border: `1px solid ${T.borderStrong}`,
+        borderRadius: T.radiusSm,
+        fontSize: 13,
+        background: T.surface,
+    },
+    popover: {
+        position: 'absolute',
+        top: 44,
+        right: 0,
+        background: T.surface,
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radius,
+        boxShadow: T.shadow,
+        padding: 12,
+        zIndex: 10,
+        minWidth: 240,
+        maxHeight: 320,
+        overflowY: 'auto',
+    },
+    popoverItem: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '6px 4px',
+        fontSize: 13,
+        color: T.text,
+        cursor: 'pointer',
+    },
+    drawerHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
+    drawerTitle: { fontSize: 16, fontWeight: 700, color: T.text, margin: 0 },
+    drawerSub: { fontSize: 12, color: T.textMuted, marginTop: 2 },
+    drawerSection: { marginTop: 14 },
+    drawerSectionTitle: {
+        fontSize: 11,
+        fontWeight: 700,
+        color: T.textMuted,
+        textTransform: 'uppercase',
+        letterSpacing: '0.06em',
+        marginBottom: 6,
+    },
+    enrollmentCard: {
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radiusSm,
+        padding: 10,
+        marginBottom: 8,
+        fontSize: 12,
+    },
+    eventRow: {
+        display: 'flex',
+        justifyContent: 'space-between',
+        padding: '6px 4px',
+        borderBottom: `1px dashed ${T.bgAlt}`,
+        fontSize: 12,
+    },
 };
 
-const pillFor = (status?: string) => {
-    if (!status) return { ...C.pill, background: '#E5E7EB', color: '#374151' };
-    if (status === 'ACTIVE') return { ...C.pill, background: '#DCFCE7', color: '#166534' };
-    if (status === 'COMPLETED') return { ...C.pill, background: '#DBEAFE', color: '#1E40AF' };
-    if (status === 'CANCELLED') return { ...C.pill, background: '#FEE2E2', color: '#991B1B' };
-    return { ...C.pill, background: '#F3F4F6', color: '#374151' };
+const pillFor = (status?: string): React.CSSProperties => {
+    if (!status) return { ...C.pill, background: T.bgAlt, color: T.textMuted };
+    if (status === 'ACTIVE') return { ...C.pill, background: T.successSoft, color: T.success };
+    if (status === 'COMPLETED') return { ...C.pill, background: T.infoSoft, color: T.info };
+    if (status === 'CANCELLED') return { ...C.pill, background: T.dangerSoft, color: T.danger };
+    return { ...C.pill, background: T.bgAlt, color: T.textMuted };
 };
 
-const ME_QUERY = {
+const ShieldLockIcon = ({ size = 16, color = T.warn }: { size?: number; color?: string }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+        <path
+            d="M12 2 4 5v6c0 5 3.4 9.5 8 11 4.6-1.5 8-6 8-11V5l-8-3Z"
+            fill={color}
+            opacity="0.18"
+        />
+        <path
+            d="M12 2 4 5v6c0 5 3.4 9.5 8 11 4.6-1.5 8-6 8-11V5l-8-3Z"
+            stroke={color}
+            strokeWidth="1.6"
+            fill="none"
+            strokeLinejoin="round"
+        />
+        <rect x="9" y="10.5" width="6" height="5" rx="1" stroke={color} strokeWidth="1.4" fill="none" />
+        <path d="M10 10.5V9a2 2 0 0 1 4 0v1.5" stroke={color} strokeWidth="1.4" fill="none" />
+    </svg>
+);
+
+const ColumnsIcon = ({ size = 16, color = T.brand }: { size?: number; color?: string }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+        <rect x="3" y="4" width="18" height="16" rx="2" stroke={color} strokeWidth="1.6" />
+        <path d="M9 4v16M15 4v16" stroke={color} strokeWidth="1.6" />
+    </svg>
+);
+
+const ChevronIcon = ({ rotate = 0, color = T.brand }: { rotate?: number; color?: string }) => (
+    <svg
+        width={14}
+        height={14}
+        viewBox="0 0 24 24"
+        fill="none"
+        style={{ transform: `rotate(${rotate}deg)`, transition: 'transform 120ms' }}
+        aria-hidden
+    >
+        <path d="M9 6l6 6-6 6" stroke={color} strokeWidth="2" fill="none" strokeLinecap="round" />
+    </svg>
+);
+
+const ME_QUERY: any = {
     me: { resource: 'me', params: { fields: 'authorities' } },
-} as const;
+};
 
 const SETTINGS_QUERY: any = {
     settings: {
         resource: 'systemSettings',
-        params: {
-            key: ['keyProtectedFieldsEnabled'],
-        },
+        params: { key: ['keyProtectedFieldsEnabled'] },
     },
+};
+
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
+
+const renderAttrValue = (
+    value: string | undefined,
+    attribute: string,
+    protectedAttrIds: Set<string>,
+    canReveal: boolean,
+) => {
+    if (!value) return <span style={C.muted}>—</span>;
+    if (protectedAttrIds.has(attribute) && !canReveal) {
+        return (
+            <span style={C.masked} title="Protected attribute — value masked">
+                ••••••
+            </span>
+        );
+    }
+    return value;
+};
+
+const DetailDrawer = ({
+    teiUid,
+    engine,
+    onClose,
+    history,
+    stages,
+    primaryName,
+}: {
+    teiUid: string;
+    engine: ReturnType<typeof useDataEngine>;
+    onClose: () => void;
+    history: ReturnType<typeof useHistory>;
+    stages: Record<string, string>;
+    primaryName: string;
+}) => {
+    const [detail, setDetail] = useState<any | null>(null);
+    const [loading, setLoading] = useState(false);
+    const [err, setErr] = useState<string | null>(null);
+
+    useEffect(() => {
+        let alive = true;
+        setLoading(true);
+        setErr(null);
+        engine
+            .query({
+                tei: {
+                    resource: `tracker/trackedEntities/${teiUid}`,
+                    params: {
+                        fields:
+                            'trackedEntity,createdAt,updatedAt,orgUnit,attributes[attribute,displayName,value],enrollments[enrollment,program,status,enrolledAt,occurredAt,events[event,programStage,status,occurredAt,dataValues[dataElement,value]]]',
+                    },
+                },
+            })
+            .then((data: any) => {
+                if (!alive) return;
+                setDetail(data?.tei || null);
+            })
+            .catch((e: any) => {
+                if (!alive) return;
+                setErr(e?.message || 'Failed to load detail');
+            })
+            .finally(() => alive && setLoading(false));
+        return () => {
+            alive = false;
+        };
+    }, [engine, teiUid]);
+
+    return (
+        <aside style={C.drawer}>
+            <div style={C.drawerHead}>
+                <div>
+                    <h3 style={C.drawerTitle}>{primaryName || 'Record detail'}</h3>
+                    <div style={C.drawerSub}>{teiUid}</div>
+                </div>
+                <button
+                    type="button"
+                    style={{ ...C.iconBtn, width: 28, height: 28 }}
+                    onClick={onClose}
+                    aria-label="Close detail panel"
+                    title="Close"
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                        <path d="M6 6l12 12M6 18L18 6" stroke={T.brand} strokeWidth="2" strokeLinecap="round" />
+                    </svg>
+                </button>
+            </div>
+            {loading && <div style={C.muted}>Loading detail…</div>}
+            {err && <div style={{ ...C.muted, color: T.danger }}>{err}</div>}
+            {detail && (
+                <>
+                    <div style={C.drawerSection}>
+                        <div style={C.drawerSectionTitle}>Timestamps</div>
+                        <div style={{ fontSize: 12, color: T.text }}>
+                            Created: <strong>{fmtDate(detail.createdAt)}</strong>
+                        </div>
+                        <div style={{ fontSize: 12, color: T.text }}>
+                            Updated: <strong>{fmtDate(detail.updatedAt)}</strong>
+                        </div>
+                    </div>
+                    <div style={C.drawerSection}>
+                        <div style={C.drawerSectionTitle}>Enrollments &amp; events</div>
+                        {(detail.enrollments || []).length === 0 ? (
+                            <div style={C.muted}>No enrollments.</div>
+                        ) : (
+                            (detail.enrollments || []).map((enr: Enrollment) => (
+                                <div key={enr.enrollment} style={C.enrollmentCard}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                        <span style={pillFor(enr.status)}>{enr.status}</span>
+                                        <button
+                                            type="button"
+                                            style={{ ...C.btn, padding: '4px 8px', fontSize: 11 }}
+                                            onClick={() =>
+                                                history.push(
+                                                    `/enrollment?enrollmentId=${enr.enrollment}`,
+                                                )
+                                            }
+                                        >
+                                            Open
+                                        </button>
+                                    </div>
+                                    <div style={{ fontSize: 11, color: T.textMuted }}>
+                                        Enrolled: {fmtDate(enr.enrolledAt)}
+                                    </div>
+                                    {enr.events && enr.events.length > 0 && (
+                                        <div style={{ marginTop: 8 }}>
+                                            {(enr.events || []).map((ev) => (
+                                                <div key={ev.event} style={C.eventRow}>
+                                                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                                        <span style={{ fontWeight: 600 }}>
+                                                            {stages[ev.programStage || ''] ||
+                                                                ev.programStage ||
+                                                                'Event'}
+                                                        </span>
+                                                        <span style={C.muted}>
+                                                            {fmtDate(ev.occurredAt)}
+                                                        </span>
+                                                    </div>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                        <span style={pillFor(ev.status)}>{ev.status || '—'}</span>
+                                                        <button
+                                                            type="button"
+                                                            style={{ ...C.btn, padding: '2px 6px', fontSize: 11 }}
+                                                            onClick={() =>
+                                                                history.push(
+                                                                    `/viewEvent?viewEventId=${ev.event}`,
+                                                                )
+                                                            }
+                                                        >
+                                                            View
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </>
+            )}
+        </aside>
+    );
 };
 
 export const RealtimeLinelistPage = () => {
@@ -240,11 +604,17 @@ export const RealtimeLinelistPage = () => {
     const [payload, setPayload] = useState<FetchedPayload | null>(null);
     const [programMeta, setProgramMeta] = useState<any | null>(null);
     const [attrMeta, setAttrMeta] = useState<AttrMeta[]>([]);
+    const [stages, setStages] = useState<StageMeta[]>([]);
     const [primaryAttrId, setPrimaryAttrId] = useState<string | null>(null);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+    const [visibleColumns, setVisibleColumns] = useState<string[]>([]);
+    const [colsOpen, setColsOpen] = useState(false);
+    const [page, setPage] = useState(1);
+    const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
     const [search, setSearch] = useState('');
     const debouncedSearch = useDebounced(search, 350);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [selectedTei, setSelectedTei] = useState<string | null>(null);
 
     const meQuery = useDataQuery(ME_QUERY);
     const settingsQuery = useDataQuery(SETTINGS_QUERY);
@@ -264,11 +634,24 @@ export const RealtimeLinelistPage = () => {
         return new Set(attrMeta.filter((a) => a.isProtected).map((a) => a.id));
     }, [attrMeta, protectedFieldsEnabled]);
 
+    const stageMap = useMemo(() => {
+        const m: Record<string, string> = {};
+        for (const s of stages) m[s.id] = s.displayName;
+        return m;
+    }, [stages]);
+
+    // Reset pagination when scope changes
+    useEffect(() => {
+        setPage(1);
+    }, [programId, orgUnitId, debouncedSearch, pageSize]);
+
     const loadProgram = useCallback(async () => {
         if (!programId) {
             setProgramMeta(null);
             setAttrMeta([]);
+            setStages([]);
             setPrimaryAttrId(null);
+            setVisibleColumns([]);
             return;
         }
         try {
@@ -278,30 +661,42 @@ export const RealtimeLinelistPage = () => {
                     id: programId,
                     params: {
                         fields:
-                            'id,displayName,programType,trackedEntityType[id,displayName],programTrackedEntityAttributes[searchable,displayInList,trackedEntityAttribute[id,displayName,isProtected]]',
+                            'id,displayName,programType,trackedEntityType[id,displayName],programStages[id,displayName],programTrackedEntityAttributes[searchable,displayInList,trackedEntityAttribute[id,displayName,isProtected]]',
                     },
                 },
             });
             const prog = data?.program;
             setProgramMeta(prog);
-            const attrs: AttrMeta[] = (prog?.programTrackedEntityAttributes || [])
-                .map((p: any) => p?.trackedEntityAttribute)
-                .filter(Boolean)
-                .map((a: any) => ({
+            const ordered = (prog?.programTrackedEntityAttributes || []) as Array<any>;
+            const attrs: AttrMeta[] = ordered
+                .map((p: any) => ({
+                    p,
+                    a: p?.trackedEntityAttribute,
+                }))
+                .filter(({ a }) => !!a)
+                .map(({ p, a }) => ({
                     id: a.id,
                     displayName: a.displayName,
                     isProtected: !!a.isProtected,
+                    displayInList: !!p.displayInList,
+                    searchable: !!p.searchable,
                 }));
             setAttrMeta(attrs);
-            // Primary searchable attribute = first searchable (or first
-            // displayInList, or just the first attribute).
-            const ordered = (prog?.programTrackedEntityAttributes || []) as Array<any>;
             const primary =
                 ordered.find((p) => p?.searchable)?.trackedEntityAttribute?.id ||
                 ordered.find((p) => p?.displayInList)?.trackedEntityAttribute?.id ||
                 ordered[0]?.trackedEntityAttribute?.id ||
                 null;
             setPrimaryAttrId(primary);
+            // Default columns = displayInList attrs (or first 4 if none flagged)
+            const defaultCols = attrs.filter((a) => a.displayInList).map((a) => a.id);
+            setVisibleColumns(defaultCols.length > 0 ? defaultCols : attrs.slice(0, 4).map((a) => a.id));
+            setStages(
+                (prog?.programStages || []).map((s: any) => ({
+                    id: s.id,
+                    displayName: s.displayName,
+                })),
+            );
         } catch {
             setProgramMeta(null);
         }
@@ -321,14 +716,12 @@ export const RealtimeLinelistPage = () => {
                 program: programId,
                 orgUnit: orgUnitId,
                 ouMode: 'DESCENDANTS',
-                pageSize: PAGE_SIZE,
+                page,
+                pageSize,
+                totalPages: true,
                 order: 'createdAt:desc',
                 fields,
             };
-            // Server-side filter on the primary attribute (tracker only).
-            // Skip when a sensitive attr is primary and the user lacks
-            // F_VIEW_PROTECTED_DATA — searching a masked field would
-            // leak the value via the URL.
             const term = debouncedSearch.trim();
             if (isTracker && term && primaryAttrId) {
                 const protectedHit = protectedAttrIds.has(primaryAttrId);
@@ -336,15 +729,16 @@ export const RealtimeLinelistPage = () => {
                     params.filter = `${primaryAttrId}:LIKE:${term}`;
                 }
             }
-            const data: any = await engine.query({
-                result: { resource, params },
-            });
+            const data: any = await engine.query({ result: { resource, params } });
             const r = data?.result || {};
             const rows = r.instances || r.trackedEntities || r.events || [];
             setPayload({
                 kind: isTracker ? 'tracker' : 'event',
                 rows,
                 total: r.total,
+                pageCount: r.pageCount,
+                page,
+                pageSize,
                 fetchedAt: new Date(),
             });
         } catch (e: any) {
@@ -352,7 +746,7 @@ export const RealtimeLinelistPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, protectedAttrIds, canRevealProtected]);
+    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, protectedAttrIds, canRevealProtected, page, pageSize]);
 
     useEffect(() => {
         loadProgram();
@@ -365,48 +759,70 @@ export const RealtimeLinelistPage = () => {
         return () => window.clearInterval(id);
     }, [isReady, programMeta, refresh]);
 
-    const renderAttrValue = (attribute: string, value?: string) => {
-        if (!value) return <span style={C.muted}>—</span>;
-        if (protectedAttrIds.has(attribute) && !canRevealProtected) {
-            return <span style={C.masked} title="Protected — value masked">••••••</span>;
-        }
-        return value;
-    };
+    const primaryAttrLabel = useMemo(() => {
+        if (!primaryAttrId) return 'attribute';
+        return attrMeta.find((a) => a.id === primaryAttrId)?.displayName || 'attribute';
+    }, [primaryAttrId, attrMeta]);
 
-    const renderTei = (tei: TEI) => {
-        const primaryAttrVal = primaryAttrId
-            ? tei.attributes?.find((a) => a.attribute === primaryAttrId)
-            : tei.attributes?.[0];
-        const primaryId = primaryAttrId || primaryAttrVal?.attribute || '';
+    const searchProtectedBlocked =
+        !!primaryAttrId && protectedAttrIds.has(primaryAttrId) && !canRevealProtected;
+
+    const toggleColumn = (id: string) =>
+        setVisibleColumns((prev) =>
+            prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id],
+        );
+
+    const selectedTeiObj = useMemo(
+        () =>
+            payload?.kind === 'tracker'
+                ? (payload.rows as TEI[]).find((t) => t.trackedEntity === selectedTei) || null
+                : null,
+        [payload, selectedTei],
+    );
+
+    const renderTeiRow = (tei: TEI) => {
+        const selected = tei.trackedEntity === selectedTei;
+        const tdStyle = selected ? { ...C.td, ...C.tdSelected } : C.td;
+        const attrByUid: Record<string, string> = {};
+        for (const a of tei.attributes || []) attrByUid[a.attribute] = a.value;
         const e = tei.enrollments?.[0];
         return (
-            <tr key={tei.trackedEntity}>
-                <td style={C.td}>
+            <tr
+                key={tei.trackedEntity}
+                onClick={() => setSelectedTei(tei.trackedEntity)}
+                style={{ cursor: 'pointer' }}
+            >
+                <td style={tdStyle}>
                     <span style={C.mono}>{tei.trackedEntity}</span>
                 </td>
-                <td style={C.td}>{renderAttrValue(primaryId, primaryAttrVal?.value)}</td>
-                <td style={C.td}>
+                {visibleColumns.map((colId) => (
+                    <td key={colId} style={tdStyle}>
+                        {renderAttrValue(attrByUid[colId], colId, protectedAttrIds, canRevealProtected)}
+                    </td>
+                ))}
+                <td style={tdStyle}>
                     {e ? <span style={pillFor(e.status)}>{e.status}</span> : <span style={C.muted}>—</span>}
                 </td>
-                <td style={C.td}>{fmtDate(e?.enrolledAt)}</td>
-                <td style={C.td}>{fmtDate(tei.createdAt)}</td>
-                <td style={C.td}>{fmtDate(tei.updatedAt)}</td>
-                <td style={C.td}>
-                    {e ? (
-                        <button
-                            type="button"
-                            style={C.btn}
-                            onClick={() => history.push(`/enrollment?enrollmentId=${e.enrollment}`)}
-                        >
-                            Open
-                        </button>
-                    ) : null}
+                <td style={tdStyle}>{fmtDate(tei.createdAt)}</td>
+                <td style={tdStyle}>{fmtDate(tei.updatedAt)}</td>
+                <td style={tdStyle}>
+                    <button
+                        type="button"
+                        style={C.btn}
+                        onClick={(ev) => {
+                            ev.stopPropagation();
+                            if (e) history.push(`/enrollment?enrollmentId=${e.enrollment}`);
+                        }}
+                        disabled={!e}
+                    >
+                        Open
+                    </button>
                 </td>
             </tr>
         );
     };
 
-    const renderEvent = (ev: Event) => (
+    const renderEventRow = (ev: EventRow) => (
         <tr key={ev.event}>
             <td style={C.td}>
                 <span style={C.mono}>{ev.event}</span>
@@ -414,9 +830,9 @@ export const RealtimeLinelistPage = () => {
             <td style={C.td}>
                 <span style={pillFor(ev.status)}>{ev.status || '—'}</span>
             </td>
+            <td style={C.td}>{stageMap[ev.programStage || ''] || ev.programStage || '—'}</td>
             <td style={C.td}>{fmtDate(ev.occurredAt)}</td>
             <td style={C.td}>{fmtDate(ev.createdAt)}</td>
-            <td style={C.td}>{fmtDate(ev.updatedAt)}</td>
             <td style={C.td}>{ev.dataValues?.length ?? 0}</td>
             <td style={C.td}>
                 <button
@@ -430,99 +846,38 @@ export const RealtimeLinelistPage = () => {
         </tr>
     );
 
-    const primaryAttrLabel = useMemo(() => {
-        if (!primaryAttrId) return 'attribute';
-        return (
-            attrMeta.find((a) => a.id === primaryAttrId)?.displayName || 'attribute'
-        );
-    }, [primaryAttrId, attrMeta]);
-    const searchDisabled = !isReady || (!primaryAttrId);
-    const searchProtectedBlocked =
-        !!primaryAttrId &&
-        protectedAttrIds.has(primaryAttrId) &&
-        !canRevealProtected;
+    const pageCount = payload?.pageCount || (payload?.total ? Math.ceil(payload.total / pageSize) : 0);
+    const visibleAttrMeta = attrMeta.filter((a) => visibleColumns.includes(a.id));
+    const showDrawer = payload?.kind === 'tracker' && selectedTei && selectedTeiObj;
 
     return (
         <>
             <TopBar programId={programId} orgUnitId={orgUnitId} selectedCategories={undefined} />
-            <div style={C.page}>
-                {protectedFieldsEnabled && (
-                    <div
-                        data-test="linelist-protected-data-notice"
-                        style={{
-                            padding: '10px 14px',
-                            background: '#FFFBEB',
-                            border: '1px solid #FCD34D',
-                            color: '#92400E',
-                            borderRadius: 6,
-                            marginBottom: 12,
-                            fontSize: 13,
-                        }}
-                    >
-                        <strong>Protected data settings active.</strong>{' '}
-                        Sensitive attributes are masked
-                        {canRevealProtected
-                            ? ' until you open the record.'
-                            : ' — you don\'t have F_VIEW_PROTECTED_DATA, so values won\'t be revealed here.'}
-                    </div>
-                )}
-
+            <div style={C.shell}>
                 <div style={C.headerRow}>
-                    <div>
-                        <h2 style={C.title}>Live records</h2>
-                        <div style={C.subtitle}>
-                            Realtime line listing — reads tracker tables directly, refreshes every{' '}
-                            {POLL_MS / 1000}s.
+                    <div style={C.headerLeft}>
+                        <div>
+                            <h1 style={C.title}>Live records</h1>
+                            <div style={C.subtitle}>
+                                Realtime line listing — reads tracker tables directly, refreshes every{' '}
+                                {POLL_MS / 1000}s.
+                            </div>
                         </div>
+                        {protectedFieldsEnabled && (
+                            <span
+                                style={C.pillProtected}
+                                title={
+                                    canRevealProtected
+                                        ? 'Protected data settings active — sensitive attributes are masked until you open the record.'
+                                        : 'Protected data settings active — you do not have F_VIEW_PROTECTED_DATA, so sensitive attribute values stay masked here.'
+                                }
+                            >
+                                <ShieldLockIcon size={14} />
+                                Protected data
+                            </span>
+                        )}
                     </div>
                 </div>
-
-                <div style={C.controlsRow}>
-                    <input
-                        type="search"
-                        style={C.search}
-                        placeholder={
-                            searchProtectedBlocked
-                                ? `Search disabled — ${primaryAttrLabel} is a protected field`
-                                : `Search by ${primaryAttrLabel}…`
-                        }
-                        value={search}
-                        onChange={(e) => setSearch(e.target.value)}
-                        disabled={searchDisabled || searchProtectedBlocked}
-                        aria-label="Search records"
-                    />
-                    <button
-                        type="button"
-                        style={C.btn}
-                        onClick={() => history.push(`/?programId=${programId}&orgUnitId=${orgUnitId}`)}
-                    >
-                        Working list
-                    </button>
-                    <button
-                        type="button"
-                        style={C.btn}
-                        onClick={() => history.push(`/search?programId=${programId}`)}
-                    >
-                        Advanced search
-                    </button>
-                    <button
-                        type="button"
-                        style={C.btnPrimary}
-                        onClick={refresh}
-                        disabled={loading || !isReady}
-                    >
-                        {loading ? 'Refreshing…' : 'Refresh now'}
-                    </button>
-                </div>
-
-                {!isReady && (
-                    <div style={C.notice}>
-                        Pick a program and org unit in the bar above (or append{' '}
-                        <code>?programId=…&orgUnitId=…</code> to the URL).
-                    </div>
-                )}
-
-                {error && <div style={C.error}>Could not load records: {error}</div>}
 
                 <div style={C.statsRow}>
                     <div style={C.tile}>
@@ -536,13 +891,14 @@ export const RealtimeLinelistPage = () => {
                         <div style={C.tileValue}>{programMeta?.programType || '—'}</div>
                     </div>
                     <div style={C.tile}>
-                        Org unit
-                        <div style={C.tileValue} title={orgUnitId}>
-                            {orgUnitId || '—'}
+                        Page
+                        <div style={C.tileValue}>
+                            {page}
+                            {pageCount ? ` / ${pageCount}` : ''}
                         </div>
                     </div>
                     <div style={C.tile}>
-                        Records (this page)
+                        Records (page)
                         <div style={C.tileValue}>{payload?.rows.length ?? '—'}</div>
                     </div>
                     <div style={C.tile}>
@@ -557,46 +913,239 @@ export const RealtimeLinelistPage = () => {
                     </div>
                 </div>
 
-                <div style={C.tableWrap}>
-                    {!payload && loading ? (
-                        <div style={C.empty}>Loading…</div>
-                    ) : payload && payload.rows.length === 0 ? (
-                        <div style={C.empty}>
-                            {debouncedSearch
-                                ? 'No records match the current search.'
-                                : 'No records match this program / org unit yet.'}
+                <div style={{ ...C.controlsRow, position: 'relative' }}>
+                    <input
+                        type="search"
+                        style={C.search}
+                        placeholder={
+                            searchProtectedBlocked
+                                ? `Search disabled — ${primaryAttrLabel} is a protected field`
+                                : `Search by ${primaryAttrLabel}…`
+                        }
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                        disabled={!isReady || !primaryAttrId || searchProtectedBlocked}
+                        aria-label="Search records"
+                    />
+                    <button
+                        type="button"
+                        style={C.btn}
+                        onClick={() => history.push(`/search?programId=${programId}&orgUnitId=${orgUnitId}`)}
+                        title="Open the full advanced search experience"
+                    >
+                        Advanced search
+                    </button>
+                    <button
+                        type="button"
+                        style={C.iconBtn}
+                        onClick={() => setColsOpen((v) => !v)}
+                        aria-label="Manage columns"
+                        title="Manage columns"
+                    >
+                        <ColumnsIcon />
+                    </button>
+                    <button
+                        type="button"
+                        style={C.btn}
+                        onClick={() => history.push(`/?programId=${programId}&orgUnitId=${orgUnitId}`)}
+                    >
+                        Working list
+                    </button>
+                    <button
+                        type="button"
+                        style={C.btnPrimary}
+                        onClick={refresh}
+                        disabled={loading || !isReady}
+                    >
+                        {loading ? 'Refreshing…' : 'Refresh now'}
+                    </button>
+                    {colsOpen && (
+                        <div style={C.popover}>
+                            <div style={{ ...C.drawerSectionTitle, marginBottom: 8 }}>Columns</div>
+                            {attrMeta.length === 0 ? (
+                                <div style={C.muted}>No attributes available.</div>
+                            ) : (
+                                attrMeta.map((a) => (
+                                    <label key={a.id} style={C.popoverItem}>
+                                        <input
+                                            type="checkbox"
+                                            checked={visibleColumns.includes(a.id)}
+                                            onChange={() => toggleColumn(a.id)}
+                                        />
+                                        <span>
+                                            {a.displayName}
+                                            {a.isProtected && (
+                                                <span style={{ marginLeft: 6 }}>
+                                                    <ShieldLockIcon size={12} />
+                                                </span>
+                                            )}
+                                        </span>
+                                    </label>
+                                ))
+                            )}
                         </div>
-                    ) : payload && payload.kind === 'tracker' ? (
-                        <table style={C.table}>
-                            <thead>
-                                <tr>
-                                    <th style={C.th}>Tracked Entity</th>
-                                    <th style={C.th}>{primaryAttrLabel}</th>
-                                    <th style={C.th}>Status</th>
-                                    <th style={C.th}>Enrolled at</th>
-                                    <th style={C.th}>Created</th>
-                                    <th style={C.th}>Last updated</th>
-                                    <th style={C.th}></th>
-                                </tr>
-                            </thead>
-                            <tbody>{(payload.rows as TEI[]).map(renderTei)}</tbody>
-                        </table>
-                    ) : payload && payload.kind === 'event' ? (
-                        <table style={C.table}>
-                            <thead>
-                                <tr>
-                                    <th style={C.th}>Event</th>
-                                    <th style={C.th}>Status</th>
-                                    <th style={C.th}>Occurred at</th>
-                                    <th style={C.th}>Created</th>
-                                    <th style={C.th}>Last updated</th>
-                                    <th style={C.th}>Data values</th>
-                                    <th style={C.th}></th>
-                                </tr>
-                            </thead>
-                            <tbody>{(payload.rows as Event[]).map(renderEvent)}</tbody>
-                        </table>
-                    ) : null}
+                    )}
+                </div>
+
+                {!isReady && (
+                    <div style={{ ...C.tile, marginBottom: 12 }}>
+                        Pick a program and org unit in the bar above (or append{' '}
+                        <code>?programId=…&orgUnitId=…</code> to the URL).
+                    </div>
+                )}
+
+                {error && (
+                    <div
+                        style={{
+                            padding: '10px 14px',
+                            background: T.dangerSoft,
+                            border: `1px solid ${T.danger}`,
+                            color: T.danger,
+                            borderRadius: T.radiusSm,
+                            marginBottom: 12,
+                            fontSize: 13,
+                        }}
+                    >
+                        Could not load records: {error}
+                    </div>
+                )}
+
+                <div style={C.body}>
+                    <div style={C.main}>
+                        <div style={C.tableWrap}>
+                            <div style={C.tableScroll}>
+                                {!payload && loading ? (
+                                    <div style={C.empty}>Loading…</div>
+                                ) : payload && payload.rows.length === 0 ? (
+                                    <div style={C.empty}>
+                                        {debouncedSearch
+                                            ? 'No records match the current search.'
+                                            : 'No records match this program / org unit yet.'}
+                                    </div>
+                                ) : payload && payload.kind === 'tracker' ? (
+                                    <table style={C.table}>
+                                        <thead>
+                                            <tr>
+                                                <th style={C.th}>Tracked Entity</th>
+                                                {visibleAttrMeta.map((a) => (
+                                                    <th key={a.id} style={C.th}>
+                                                        {a.displayName}
+                                                        {a.isProtected && (
+                                                            <span style={{ marginLeft: 4 }}>
+                                                                <ShieldLockIcon size={11} />
+                                                            </span>
+                                                        )}
+                                                    </th>
+                                                ))}
+                                                <th style={C.th}>Status</th>
+                                                <th style={C.th}>Created</th>
+                                                <th style={C.th}>Updated</th>
+                                                <th style={C.th}></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>{(payload.rows as TEI[]).map(renderTeiRow)}</tbody>
+                                    </table>
+                                ) : payload && payload.kind === 'event' ? (
+                                    <table style={C.table}>
+                                        <thead>
+                                            <tr>
+                                                <th style={C.th}>Event</th>
+                                                <th style={C.th}>Status</th>
+                                                <th style={C.th}>Stage</th>
+                                                <th style={C.th}>Occurred at</th>
+                                                <th style={C.th}>Created</th>
+                                                <th style={C.th}>Values</th>
+                                                <th style={C.th}></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>{(payload.rows as EventRow[]).map(renderEventRow)}</tbody>
+                                    </table>
+                                ) : null}
+                            </div>
+                            {payload && (
+                                <div style={C.pagerRow}>
+                                    <div style={C.pagerInfo}>
+                                        Showing page <strong>{page}</strong>
+                                        {pageCount ? <> of <strong>{pageCount}</strong></> : null}
+                                        {payload.total ? <> · {payload.total} total</> : null}
+                                    </div>
+                                    <div style={C.pagerBtns}>
+                                        <label style={C.muted} htmlFor="vw-pagesize">
+                                            Page size
+                                        </label>
+                                        <select
+                                            id="vw-pagesize"
+                                            style={C.pagerSelect}
+                                            value={pageSize}
+                                            onChange={(e) => setPageSize(parseInt(e.target.value, 10))}
+                                        >
+                                            {PAGE_SIZE_OPTIONS.map((n) => (
+                                                <option key={n} value={n}>
+                                                    {n}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button
+                                            type="button"
+                                            style={C.btn}
+                                            disabled={page <= 1 || loading}
+                                            onClick={() => setPage(1)}
+                                            aria-label="First page"
+                                        >
+                                            «
+                                        </button>
+                                        <button
+                                            type="button"
+                                            style={C.btn}
+                                            disabled={page <= 1 || loading}
+                                            onClick={() => setPage((p) => Math.max(1, p - 1))}
+                                            aria-label="Previous page"
+                                        >
+                                            <ChevronIcon rotate={180} />
+                                        </button>
+                                        <button
+                                            type="button"
+                                            style={C.btn}
+                                            disabled={(pageCount > 0 && page >= pageCount) || loading}
+                                            onClick={() =>
+                                                setPage((p) => (pageCount ? Math.min(pageCount, p + 1) : p + 1))
+                                            }
+                                            aria-label="Next page"
+                                        >
+                                            <ChevronIcon />
+                                        </button>
+                                        {pageCount > 0 && (
+                                            <button
+                                                type="button"
+                                                style={C.btn}
+                                                disabled={page >= pageCount || loading}
+                                                onClick={() => setPage(pageCount)}
+                                                aria-label="Last page"
+                                            >
+                                                »
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    {showDrawer && (
+                        <DetailDrawer
+                            teiUid={selectedTei!}
+                            engine={engine}
+                            onClose={() => setSelectedTei(null)}
+                            history={history}
+                            stages={stageMap}
+                            primaryName={
+                                primaryAttrId && selectedTeiObj
+                                    ? selectedTeiObj.attributes?.find(
+                                          (a) => a.attribute === primaryAttrId,
+                                      )?.value || ''
+                                    : ''
+                            }
+                        />
+                    )}
                 </div>
             </div>
         </>
