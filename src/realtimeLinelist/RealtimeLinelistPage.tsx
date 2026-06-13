@@ -106,6 +106,21 @@ type AttrMeta = {
     isProtected: boolean;
     displayInList: boolean;
     searchable: boolean;
+    /**
+     * Lookup of option-set `code -> displayName` for this attribute,
+     * if it's bound to an option set. When present, the line list
+     * resolves stored codes (e.g. `OPH00257`) into human labels
+     * (e.g. `Male`). Empty map means the attribute is free-text.
+     */
+    optionMap?: Record<string, string>;
+    /**
+     * True when the attribute carries PII / sensitive data and should
+     * be masked in the line list by default. Falls back to the metadata
+     * `isProtected` flag but the line list never reveals these values
+     * inline — opening the record (drawer or full enrollment page) is
+     * the supported reveal path.
+     */
+    sensitive: boolean;
 };
 type StageMeta = { id: string; displayName: string };
 
@@ -122,6 +137,70 @@ const fmtDate = (iso?: string) => {
     } catch {
         return iso;
     }
+};
+
+/**
+ * Vitalworks Pro — should the line list treat this attribute as PII?
+ *
+ * The list view is the riskiest surface (many rows visible at once, easy
+ * to screenshot, easy to share). We err strongly on the side of masking:
+ *   - any attribute the metadata flags `isProtected` or `confidential`
+ *   - obvious identifier value types (PHONE_NUMBER, EMAIL, PERSONAL_ID,
+ *     IDENTIFIER, AGE, USERNAME)
+ *   - any attribute whose display name hints at PII (name, phone, email,
+ *     address, dob, id number, contact)
+ * The drawer (one-record-at-a-time) reveals the real value once the
+ * user explicitly picks a record.
+ */
+const PII_NAME_HINTS = [
+    'name',
+    'phone',
+    'mobile',
+    'email',
+    'address',
+    'dob',
+    'date of birth',
+    'national id',
+    'identifier',
+    'identity',
+    'passport',
+    'nic',
+    'contact',
+    'gps',
+    'latitude',
+    'longitude',
+    // Per-patient assigned identifiers commonly used in HIV / clinical
+    // tracker programs. Each of these uniquely keys back to one person
+    // and therefore counts as PII for line-list purposes.
+    'art number',
+    'art no',
+    'patient id',
+    'patient no',
+    'patient number',
+    'patient barcode',
+    'barcode',
+    'hts client',
+    'client code',
+    'client number',
+    'mrn',
+    'medical record',
+    'registration number',
+    'enrollment number',
+    'beneficiary',
+];
+const PII_VALUE_TYPES = new Set([
+    'PHONE_NUMBER',
+    'EMAIL',
+    'PERSONAL_ID',
+    'IDENTIFIER',
+    'AGE',
+    'USERNAME',
+]);
+const isSensitiveAttr = (a: any): boolean => {
+    if (a?.isProtected || a?.confidential) return true;
+    if (a?.valueType && PII_VALUE_TYPES.has(String(a.valueType))) return true;
+    const name = String(a?.displayName || '').toLowerCase();
+    return PII_NAME_HINTS.some((h) => name.includes(h));
 };
 
 const useDebounced = <T,>(value: T, ms = 350) => {
@@ -433,20 +512,29 @@ const SETTINGS_QUERY: any = {
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
 
+/**
+ * Vitalworks Pro — render an attribute cell.
+ *
+ * Optionset codes are resolved to displayName via `optionMap`. Sensitive
+ * attributes (PII or explicitly protected) are always masked in the
+ * line list; the drawer is the supported reveal path.
+ */
 const renderAttrValue = (
     value: string | undefined,
     attribute: string,
-    protectedAttrIds: Set<string>,
-    canReveal: boolean,
+    sensitiveAttrIds: Set<string>,
+    optionMaps: Record<string, Record<string, string>>,
 ) => {
-    if (!value) return <span style={C.muted}>—</span>;
-    if (protectedAttrIds.has(attribute) && !canReveal) {
+    if (value == null || value === '') return <span style={C.muted}>—</span>;
+    if (sensitiveAttrIds.has(attribute)) {
         return (
-            <span style={C.masked} title="Protected attribute — value masked">
+            <span style={C.masked} title="Sensitive — open the record to view">
                 ••••••
             </span>
         );
     }
+    const optMap = optionMaps[attribute];
+    if (optMap && optMap[value] != null) return optMap[value];
     return value;
 };
 
@@ -629,16 +717,29 @@ export const RealtimeLinelistPage = () => {
         return auths.includes('ALL') || auths.includes(F_VIEW_PROTECTED_DATA);
     }, [meQuery.data]);
 
-    const protectedAttrIds = useMemo(() => {
-        if (!protectedFieldsEnabled) return new Set<string>();
-        return new Set(attrMeta.filter((a) => a.isProtected).map((a) => a.id));
-    }, [attrMeta, protectedFieldsEnabled]);
+    // Vitalworks Pro — in the line list every PII / protected attribute is
+    // masked **by default**, irrespective of authority or the global
+    // protected-fields system setting. The list is a high-volume surface;
+    // accidental disclosure is the threat we care about. The detail
+    // drawer reveals individual values on demand for one record at a time.
+    const sensitiveAttrIds = useMemo(
+        () => new Set(attrMeta.filter((a) => a.sensitive).map((a) => a.id)),
+        [attrMeta],
+    );
 
     const stageMap = useMemo(() => {
         const m: Record<string, string> = {};
         for (const s of stages) m[s.id] = s.displayName;
         return m;
     }, [stages]);
+
+    const optionMaps = useMemo(() => {
+        const m: Record<string, Record<string, string>> = {};
+        for (const a of attrMeta) {
+            if (a.optionMap) m[a.id] = a.optionMap;
+        }
+        return m;
+    }, [attrMeta]);
 
     // Reset pagination when scope changes
     useEffect(() => {
@@ -661,7 +762,7 @@ export const RealtimeLinelistPage = () => {
                     id: programId,
                     params: {
                         fields:
-                            'id,displayName,programType,trackedEntityType[id,displayName],programStages[id,displayName],programTrackedEntityAttributes[searchable,displayInList,trackedEntityAttribute[id,displayName,isProtected]]',
+                            'id,displayName,programType,trackedEntityType[id,displayName],programStages[id,displayName],programTrackedEntityAttributes[searchable,displayInList,trackedEntityAttribute[id,displayName,valueType,isProtected,confidential,optionSet[id,options[code,displayName]]]]',
                     },
                 },
             });
@@ -669,18 +770,30 @@ export const RealtimeLinelistPage = () => {
             setProgramMeta(prog);
             const ordered = (prog?.programTrackedEntityAttributes || []) as Array<any>;
             const attrs: AttrMeta[] = ordered
-                .map((p: any) => ({
-                    p,
-                    a: p?.trackedEntityAttribute,
-                }))
+                .map((p: any) => ({ p, a: p?.trackedEntityAttribute }))
                 .filter(({ a }) => !!a)
-                .map(({ p, a }) => ({
-                    id: a.id,
-                    displayName: a.displayName,
-                    isProtected: !!a.isProtected,
-                    displayInList: !!p.displayInList,
-                    searchable: !!p.searchable,
-                }));
+                .map(({ p, a }) => {
+                    const opts: Array<any> = a.optionSet?.options || [];
+                    const optionMap: Record<string, string> = {};
+                    for (const o of opts) {
+                        if (o?.code != null) optionMap[String(o.code)] = o.displayName || o.code;
+                    }
+                    return {
+                        id: a.id,
+                        displayName: a.displayName,
+                        isProtected: !!a.isProtected,
+                        // PII heuristic for the line list: anything explicitly
+                        // flagged protected/confidential, plus the obvious
+                        // identifier value-types (PHONE_NUMBER, EMAIL,
+                        // PERSONAL_ID, IDENTIFIER) and any field whose name
+                        // hints at it. Errs on the side of masking; the
+                        // drawer surfaces the real value for the picked row.
+                        sensitive: isSensitiveAttr(a),
+                        displayInList: !!p.displayInList,
+                        searchable: !!p.searchable,
+                        optionMap: Object.keys(optionMap).length ? optionMap : undefined,
+                    } as AttrMeta;
+                });
             setAttrMeta(attrs);
             const primary =
                 ordered.find((p) => p?.searchable)?.trackedEntityAttribute?.id ||
@@ -724,8 +837,11 @@ export const RealtimeLinelistPage = () => {
             };
             const term = debouncedSearch.trim();
             if (isTracker && term && primaryAttrId) {
-                const protectedHit = protectedAttrIds.has(primaryAttrId);
-                if (!protectedHit || canRevealProtected) {
+                // Don't push a sensitive value into the query string; the
+                // line list always masks PII/protected attributes, so
+                // searching by one would leak the cleartext into the URL
+                // and access logs.
+                if (!sensitiveAttrIds.has(primaryAttrId)) {
                     params.filter = `${primaryAttrId}:LIKE:${term}`;
                 }
             }
@@ -746,7 +862,7 @@ export const RealtimeLinelistPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, protectedAttrIds, canRevealProtected, page, pageSize]);
+    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, sensitiveAttrIds, page, pageSize]);
 
     useEffect(() => {
         loadProgram();
@@ -764,8 +880,9 @@ export const RealtimeLinelistPage = () => {
         return attrMeta.find((a) => a.id === primaryAttrId)?.displayName || 'attribute';
     }, [primaryAttrId, attrMeta]);
 
-    const searchProtectedBlocked =
-        !!primaryAttrId && protectedAttrIds.has(primaryAttrId) && !canRevealProtected;
+    // Search is disabled when the primary searchable attribute is itself
+    // sensitive — typing the cleartext into the URL would leak it.
+    const searchProtectedBlocked = !!primaryAttrId && sensitiveAttrIds.has(primaryAttrId);
 
     const toggleColumn = (id: string) =>
         setVisibleColumns((prev) =>
@@ -780,7 +897,7 @@ export const RealtimeLinelistPage = () => {
         [payload, selectedTei],
     );
 
-    const renderTeiRow = (tei: TEI) => {
+    const renderTeiRow = (tei: TEI, columns: AttrMeta[]) => {
         const selected = tei.trackedEntity === selectedTei;
         const tdStyle = selected ? { ...C.td, ...C.tdSelected } : C.td;
         const attrByUid: Record<string, string> = {};
@@ -795,9 +912,12 @@ export const RealtimeLinelistPage = () => {
                 <td style={tdStyle}>
                     <span style={C.mono}>{tei.trackedEntity}</span>
                 </td>
-                {visibleColumns.map((colId) => (
-                    <td key={colId} style={tdStyle}>
-                        {renderAttrValue(attrByUid[colId], colId, protectedAttrIds, canRevealProtected)}
+                {/* Iterate the *same* `columns` array the header uses so
+                  * the two never drift apart when the user toggles
+                  * column visibility. */}
+                {columns.map((col) => (
+                    <td key={col.id} style={tdStyle}>
+                        {renderAttrValue(attrByUid[col.id], col.id, sensitiveAttrIds, optionMaps)}
                     </td>
                 ))}
                 <td style={tdStyle}>
@@ -847,8 +967,16 @@ export const RealtimeLinelistPage = () => {
     );
 
     const pageCount = payload?.pageCount || (payload?.total ? Math.ceil(payload.total / pageSize) : 0);
-    const visibleAttrMeta = attrMeta.filter((a) => visibleColumns.includes(a.id));
+    // Single ordered list used for BOTH the header row and the cell row,
+    // in the user-selected order. Eliminates the "column header doesn't
+    // match value" bug we hit when the two loops drifted apart.
+    const orderedColumns: AttrMeta[] = useMemo(() => {
+        const byId: Record<string, AttrMeta> = {};
+        for (const a of attrMeta) byId[a.id] = a;
+        return visibleColumns.map((id) => byId[id]).filter(Boolean);
+    }, [attrMeta, visibleColumns]);
     const showDrawer = payload?.kind === 'tracker' && selectedTei && selectedTeiObj;
+    const sensitiveCount = orderedColumns.filter((c) => c.sensitive).length;
 
     return (
         <>
@@ -863,14 +991,12 @@ export const RealtimeLinelistPage = () => {
                                 {POLL_MS / 1000}s.
                             </div>
                         </div>
-                        {protectedFieldsEnabled && (
+                        {(protectedFieldsEnabled || sensitiveCount > 0) && (
                             <span
                                 style={C.pillProtected}
-                                title={
-                                    canRevealProtected
-                                        ? 'Protected data settings active — sensitive attributes are masked until you open the record.'
-                                        : 'Protected data settings active — you do not have F_VIEW_PROTECTED_DATA, so sensitive attribute values stay masked here.'
-                                }
+                                title={`${sensitiveCount || 0} sensitive attribute${
+                                    sensitiveCount === 1 ? '' : 's'
+                                } masked. Open a record to view the actual values.`}
                             >
                                 <ShieldLockIcon size={14} />
                                 Protected data
@@ -974,8 +1100,11 @@ export const RealtimeLinelistPage = () => {
                                         />
                                         <span>
                                             {a.displayName}
-                                            {a.isProtected && (
-                                                <span style={{ marginLeft: 6 }}>
+                                            {a.sensitive && (
+                                                <span
+                                                    style={{ marginLeft: 6 }}
+                                                    title="Sensitive — masked in the list"
+                                                >
                                                     <ShieldLockIcon size={12} />
                                                 </span>
                                             )}
@@ -1027,11 +1156,14 @@ export const RealtimeLinelistPage = () => {
                                         <thead>
                                             <tr>
                                                 <th style={C.th}>Tracked Entity</th>
-                                                {visibleAttrMeta.map((a) => (
+                                                {orderedColumns.map((a) => (
                                                     <th key={a.id} style={C.th}>
                                                         {a.displayName}
-                                                        {a.isProtected && (
-                                                            <span style={{ marginLeft: 4 }}>
+                                                        {a.sensitive && (
+                                                            <span
+                                                                style={{ marginLeft: 4 }}
+                                                                title="Sensitive — masked"
+                                                            >
                                                                 <ShieldLockIcon size={11} />
                                                             </span>
                                                         )}
@@ -1043,7 +1175,11 @@ export const RealtimeLinelistPage = () => {
                                                 <th style={C.th}></th>
                                             </tr>
                                         </thead>
-                                        <tbody>{(payload.rows as TEI[]).map(renderTeiRow)}</tbody>
+                                        <tbody>
+                                            {(payload.rows as TEI[]).map((tei) =>
+                                                renderTeiRow(tei, orderedColumns),
+                                            )}
+                                        </tbody>
                                     </table>
                                 ) : payload && payload.kind === 'event' ? (
                                     <table style={C.table}>
