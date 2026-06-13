@@ -102,6 +102,7 @@ export const TopBarActions = ({
         <>
             <ActionButtons
                 selectedProgramId={selectedProgramId}
+                selectedOrgUnitId={selectedOrgUnitId}
                 onFindClick={handleOpenSearchPage}
                 onFindClickWithoutProgramId={handleOpenSearchPageWithoutProgramId}
                 onNewClick={handleOpenNewRegistrationPage}

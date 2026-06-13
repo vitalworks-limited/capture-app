@@ -1,4 +1,5 @@
 import React, { type ComponentType, useState, useEffect } from 'react';
+import { useHistory } from 'react-router-dom';
 import { withStyles, type WithStyles } from 'capture-core-utils/styles';
 import i18n from '@dhis2/d2-i18n';
 import { Button, spacers, DropdownButton, FlyoutMenu, MenuItem, SplitButton } from '@dhis2/ui';
@@ -22,11 +23,13 @@ const ActionButtonsPlain = ({
     onFindClick,
     onFindClickWithoutProgramId,
     selectedProgramId,
+    selectedOrgUnitId,
     classes,
     openConfirmDialog,
 }: PlainProps & WithStyles<typeof styles>) => {
     const { trackedEntityName, scopeType, programName } = useScopeInfo(selectedProgramId);
     const [openSearch, setOpenSearch] = useState(false);
+    const history = useHistory();
 
     useEffect(() => {
         setOpenSearch(false);
@@ -110,6 +113,27 @@ const ActionButtonsPlain = ({
                     {i18n.t('Search')}
                 </DropdownButton>
             )}
+
+            {/*
+              * Vitalworks Pro — "Live records" link jumps to the realtime
+              * line listing (#/linelist), which reads straight from the
+              * tracker tables so users can verify records exist without
+              * waiting for analytics to refresh.
+              */}
+            {selectedProgramId && selectedOrgUnitId ? (
+                <Button
+                    small
+                    secondary
+                    dataTest="live-records-button"
+                    onClick={() => {
+                        history.push(
+                            `/linelist?programId=${selectedProgramId}&orgUnitId=${selectedOrgUnitId}`,
+                        );
+                    }}
+                >
+                    {i18n.t('Live records')}
+                </Button>
+            ) : null}
         </div>
     );
 };

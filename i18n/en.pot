@@ -5,8 +5,8 @@ msgstr ""
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1)\n"
-"POT-Creation-Date: 2026-06-11T12:00:09.388Z\n"
-"PO-Revision-Date: 2026-06-11T12:00:09.389Z\n"
+"POT-Creation-Date: 2026-06-13T08:44:50.379Z\n"
+"PO-Revision-Date: 2026-06-13T08:44:50.380Z\n"
 
 msgid "The application could not be loaded."
 msgstr "The application could not be loaded."
@@ -1466,6 +1466,9 @@ msgstr "Search for a {{trackedEntityName}} in {{programName}}"
 
 msgid "Search..."
 msgstr "Search..."
+
+msgid "Live records"
+msgstr "Live records"
 
 msgid "Select tracked entity type"
 msgstr "Select tracked entity type"

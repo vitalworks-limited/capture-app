@@ -9,6 +9,9 @@ import { StageEventListPage } from 'capture-core/components/Pages/StageEvent';
 import { EnrollmentEditEventPage } from 'capture-core/components/Pages/EnrollmentEditEvent';
 import { EnrollmentAddEventPage } from 'capture-core/components/Pages/EnrollmentAddEvent';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+// Vitalworks Pro — realtime line listing of tracker records, no analytics
+// dependency. See src/realtimeLinelist/RealtimeLinelistPage.tsx.
+import { RealtimeLinelistPage } from '../../realtimeLinelist/RealtimeLinelistPage';
 
 export const AppPages = () => (
     <>
@@ -21,6 +24,7 @@ export const AppPages = () => (
             <Route path="/enrollmentEventEdit" component={EnrollmentEditEventPage} />
             <Route path="/enrollmentEventNew" component={EnrollmentAddEventPage} />
             <Route path="/enrollment" component={EnrollmentPage} />
+            <Route path="/linelist" component={RealtimeLinelistPage} />
             <Route path="/:keys" component={MainPage} />
             <Route path="/" component={MainPage} />
         </Switch>
