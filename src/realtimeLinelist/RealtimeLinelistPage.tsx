@@ -768,6 +768,8 @@ const DetailDrawer = ({
     history,
     stages,
     primaryName,
+    orgUnitId,
+    programType,
 }: {
     teiUid: string;
     engine: ReturnType<typeof useDataEngine>;
@@ -775,6 +777,8 @@ const DetailDrawer = ({
     history: ReturnType<typeof useHistory>;
     stages: Record<string, string>;
     primaryName: string;
+    orgUnitId: string;
+    programType: string;
 }) => {
     const [detail, setDetail] = useState<any | null>(null);
     const [loading, setLoading] = useState(false);
@@ -883,11 +887,22 @@ const DetailDrawer = ({
                                                         <button
                                                             type="button"
                                                             style={{ ...C.btn, padding: '2px 6px', fontSize: 11 }}
-                                                            onClick={() =>
-                                                                history.push(
-                                                                    `/viewEvent?viewEventId=${ev.event}`,
-                                                                )
-                                                            }
+                                                            onClick={() => {
+                                                                // `/viewEvent` only handles event-program events
+                                                                // and throws `getEventProgramThrowIfNotFound` for
+                                                                // a tracker event. Tracker (WITH_REGISTRATION)
+                                                                // events go through `enrollmentEventEdit`, which
+                                                                // requires the `orgUnitId` query param.
+                                                                if (programType === 'WITH_REGISTRATION') {
+                                                                    history.push(
+                                                                        `/enrollmentEventEdit?eventId=${ev.event}&orgUnitId=${orgUnitId}`,
+                                                                    );
+                                                                } else {
+                                                                    history.push(
+                                                                        `/viewEvent?viewEventId=${ev.event}`,
+                                                                    );
+                                                                }
+                                                            }}
                                                         >
                                                             View
                                                         </button>
@@ -2124,6 +2139,8 @@ export const RealtimeLinelistPage = () => {
                             onClose={() => setSelectedTei(null)}
                             history={history}
                             stages={stageMap}
+                            orgUnitId={orgUnitId}
+                            programType={programMeta?.programType || ''}
                             primaryName={
                                 primaryAttrId && selectedTeiObj
                                     ? selectedTeiObj.attributes?.find(
