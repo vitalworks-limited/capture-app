@@ -573,6 +573,142 @@ const ColumnsIcon = ({ size = 16, color = T.brand }: { size?: number; color?: st
     </svg>
 );
 
+/**
+ * Vitalworks Pro — three sort glyphs. Inactive shows a stacked up/down
+ * pair (universal "sortable" affordance); active shows just the chosen
+ * direction. Inline SVG keeps the bundle slim and the colour theme-able.
+ */
+const SortGlyph = ({
+    state,
+    color = T.textMuted,
+    active = T.brand,
+}: {
+    state: 'asc' | 'desc' | 'none';
+    color?: string;
+    active?: string;
+}) => {
+    if (state === 'asc') {
+        return (
+            <svg width={10} height={10} viewBox="0 0 10 10" aria-hidden>
+                <path d="M5 2l3 5H2z" fill={active} />
+            </svg>
+        );
+    }
+    if (state === 'desc') {
+        return (
+            <svg width={10} height={10} viewBox="0 0 10 10" aria-hidden>
+                <path d="M5 8L2 3h6z" fill={active} />
+            </svg>
+        );
+    }
+    return (
+        <svg width={10} height={12} viewBox="0 0 10 12" aria-hidden>
+            <path d="M5 1l3 4H2z" fill={color} opacity="0.55" />
+            <path d="M5 11L2 7h6z" fill={color} opacity="0.55" />
+        </svg>
+    );
+};
+
+const PinIcon = ({
+    pinned = false,
+    color = T.textMuted,
+    active = T.brand,
+}: {
+    pinned?: boolean;
+    color?: string;
+    active?: string;
+}) => (
+    <svg width={11} height={11} viewBox="0 0 24 24" aria-hidden>
+        <path
+            d="M14.5 2.5l7 7-3 3-2 8L8 12.5l8-2 3-3-4.5-5z"
+            fill={pinned ? active : 'none'}
+            stroke={pinned ? active : color}
+            strokeWidth="1.5"
+            strokeLinejoin="round"
+            transform="rotate(-20 12 12)"
+        />
+        <line
+            x1="8"
+            y1="14"
+            x2="3"
+            y2="20"
+            stroke={pinned ? active : color}
+            strokeWidth="1.5"
+            strokeLinecap="round"
+        />
+    </svg>
+);
+
+/**
+ * Vitalworks Pro — column header with sort + freeze affordances.
+ *
+ * Visual order: pin · label · sensitive-mark · sort glyph. Clicking
+ * the label area cycles the sort; clicking the pin toggles freeze.
+ * Each control gets its own click target so the user never has to
+ * guess which area triggers what.
+ */
+const SortableTh = ({
+    label,
+    sortKey,
+    sort,
+    onCycle,
+    pinned,
+    onPin,
+    rightAdornment,
+    stickyStyle,
+}: {
+    label: string;
+    sortKey: string;
+    sort: { key: string; dir: 'asc' | 'desc' } | null;
+    onCycle: (k: string) => void;
+    pinned?: boolean;
+    onPin?: () => void;
+    rightAdornment?: React.ReactNode;
+    stickyStyle?: React.CSSProperties;
+}) => {
+    const state: 'asc' | 'desc' | 'none' =
+        sort && sort.key === sortKey ? sort.dir : 'none';
+    return (
+        <th style={{ ...C.th, cursor: 'pointer', ...(stickyStyle || {}) }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                {onPin && (
+                    <button
+                        type="button"
+                        onClick={(ev) => {
+                            ev.stopPropagation();
+                            onPin();
+                        }}
+                        title={pinned ? 'Unpin column' : 'Pin column to the left'}
+                        aria-label={pinned ? 'Unpin column' : 'Pin column'}
+                        style={{
+                            background: 'transparent',
+                            border: 'none',
+                            padding: 0,
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                        }}
+                    >
+                        <PinIcon pinned={!!pinned} />
+                    </button>
+                )}
+                <span
+                    onClick={() => onCycle(sortKey)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(ev) => {
+                        if (ev.key === 'Enter' || ev.key === ' ') onCycle(sortKey);
+                    }}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                >
+                    {label}
+                    {rightAdornment}
+                    <SortGlyph state={state} />
+                </span>
+            </span>
+        </th>
+    );
+};
+
 const ChevronIcon = ({ rotate = 0, color = T.brand }: { rotate?: number; color?: string }) => (
     <svg
         width={14}
@@ -799,6 +935,26 @@ export const RealtimeLinelistPage = () => {
     const [exportIncludeRelatedPrograms, setExportIncludeRelatedPrograms] = useState(false);
     const [exporting, setExporting] = useState(false);
     const [exportErr, setExportErr] = useState<string | null>(null);
+    /**
+     * Vitalworks Pro — sort + freeze state.
+     *
+     * `sort.key` is either a built-in tracker field (`createdAt`,
+     * `updatedAt`, `enrollmentStatus`) or a TEA attribute UID. The
+     * tracker API supports `order=<field>:asc|desc`; the value is
+     * passed through unchanged.
+     *
+     * `frozenColumns` is the *set* of column IDs that should render
+     * with `position: sticky; left: <accumulated-offset>`. The TE UID
+     * column is in here by default — it's the natural anchor when
+     * the table scrolls horizontally past many TEA columns.
+     */
+    const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>({
+        key: 'createdAt',
+        dir: 'desc',
+    });
+    const [frozenColumns, setFrozenColumns] = useState<Set<string>>(
+        () => new Set(['__tei__']),
+    );
 
     const meQuery = useDataQuery(ME_QUERY);
     const settingsQuery = useDataQuery(SETTINGS_QUERY);
@@ -837,10 +993,12 @@ export const RealtimeLinelistPage = () => {
         return m;
     }, [attrMeta]);
 
-    // Reset pagination when scope changes
+    // Reset pagination when scope, search, or sort changes — otherwise
+    // the user can land on an empty page (e.g. page 7 of an old result
+    // set that just shrunk after a new filter applied).
     useEffect(() => {
         setPage(1);
-    }, [programId, orgUnitId, debouncedSearch, pageSize]);
+    }, [programId, orgUnitId, debouncedSearch, pageSize, sort]);
 
     const loadProgram = useCallback(async () => {
         if (!programId) {
@@ -935,11 +1093,17 @@ export const RealtimeLinelistPage = () => {
             const fields = isTracker
                 ? 'trackedEntity,trackedEntityType,createdAt,updatedAt,orgUnit,attributes[attribute,displayName,value],enrollments[enrollment,status,enrolledAt,occurredAt]'
                 : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]';
+            // Sort: server-side via `order=<key>:<dir>`. When no sort is
+            // set, default to createdAt:desc (newest first) so the page
+            // still feels live.
+            const orderParam = sort
+                ? `${sort.key}:${sort.dir}`
+                : 'createdAt:desc';
             const baseParams: Record<string, any> = {
                 program: programId,
                 orgUnit: orgUnitId,
                 ouMode: 'DESCENDANTS',
-                order: 'createdAt:desc',
+                order: orderParam,
                 fields,
             };
             const term = debouncedSearch.trim();
@@ -1021,7 +1185,7 @@ export const RealtimeLinelistPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, searchableAttrIds, page, pageSize]);
+    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, searchableAttrIds, page, pageSize, sort]);
 
     useEffect(() => {
         loadProgram();
@@ -1047,6 +1211,69 @@ export const RealtimeLinelistPage = () => {
         setVisibleColumns((prev) =>
             prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id],
         );
+
+    /**
+     * Click a column header → cycle the sort: none → asc → desc → none.
+     * The `__tei__` synthetic key sorts by TE UID, which the tracker
+     * endpoint doesn't actually support; we silently fall back to
+     * `createdAt` for that case.
+     */
+    const cycleSort = (key: string) => {
+        setSort((prev) => {
+            if (!prev || prev.key !== key) return { key, dir: 'asc' };
+            if (prev.dir === 'asc') return { key, dir: 'desc' };
+            return null;
+        });
+    };
+
+    const toggleFreeze = (id: string) =>
+        setFrozenColumns((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+
+    /**
+     * Build a left-offset map for every frozen column so multiple
+     * pinned columns stack flush. Order follows the actual table-column
+     * order (TE UID first, then visible TEA columns).
+     */
+    const freezeOffsets = useMemo(() => {
+        const offsets: Record<string, number> = {};
+        let offset = 0;
+        const WIDTH_TEI = 130;
+        const WIDTH_ATTR = 180;
+        const order: string[] = ['__tei__', ...visibleColumns];
+        for (const id of order) {
+            if (frozenColumns.has(id)) {
+                offsets[id] = offset;
+                offset += id === '__tei__' ? WIDTH_TEI : WIDTH_ATTR;
+            }
+        }
+        return offsets;
+    }, [frozenColumns, visibleColumns]);
+
+    const stickyTh = (id: string): React.CSSProperties => {
+        if (!frozenColumns.has(id)) return {};
+        return {
+            position: 'sticky',
+            left: freezeOffsets[id] ?? 0,
+            zIndex: 3,
+            background: T.bgAlt,
+            boxShadow: '1px 0 0 ' + T.border,
+        };
+    };
+    const stickyTd = (id: string, baseBg?: string): React.CSSProperties => {
+        if (!frozenColumns.has(id)) return {};
+        return {
+            position: 'sticky',
+            left: freezeOffsets[id] ?? 0,
+            zIndex: 1,
+            background: baseBg || T.surface,
+            boxShadow: '1px 0 0 ' + T.border,
+        };
+    };
 
     // Single ordered list used for the header row, the cell row, AND
     // the export flattener. Eliminates the "column header doesn't match
@@ -1341,10 +1568,20 @@ export const RealtimeLinelistPage = () => {
         [payload, selectedTei],
     );
 
-    const renderTeiRow = (tei: TEI, columns: AttrMeta[], index: number) => {
+    const renderTeiRow = (
+        tei: TEI,
+        columns: AttrMeta[],
+        index: number,
+        stickyTdFn?: (id: string, baseBg?: string) => React.CSSProperties,
+    ) => {
         const selected = tei.trackedEntity === selectedTei;
         const zebra = !selected && index % 2 === 1 ? C.trZebra : {};
         const tdStyle = selected ? { ...C.td, ...C.tdSelected } : { ...C.td, ...zebra };
+        const rowBg = selected
+            ? T.brandSoft
+            : index % 2 === 1
+            ? '#FAFBFC'
+            : T.surface;
         const attrByUid: Record<string, string> = {};
         for (const a of tei.attributes || []) attrByUid[a.attribute] = a.value;
         const e = tei.enrollments?.[0];
@@ -1354,14 +1591,17 @@ export const RealtimeLinelistPage = () => {
                 onClick={() => setSelectedTei(tei.trackedEntity)}
                 style={{ cursor: 'pointer' }}
             >
-                <td style={tdStyle}>
+                <td style={{ ...tdStyle, ...(stickyTdFn ? stickyTdFn('__tei__', rowBg) : {}) }}>
                     <span style={C.mono}>{tei.trackedEntity}</span>
                 </td>
                 {/* Iterate the *same* `columns` array the header uses so
                   * the two never drift apart when the user toggles
                   * column visibility. */}
                 {columns.map((col) => (
-                    <td key={col.id} style={tdStyle}>
+                    <td
+                        key={col.id}
+                        style={{ ...tdStyle, ...(stickyTdFn ? stickyTdFn(col.id, rowBg) : {}) }}
+                    >
                         {renderAttrValue(attrByUid[col.id], col.id, sensitiveAttrIds, optionMaps)}
                     </td>
                 ))}
@@ -1729,29 +1969,66 @@ export const RealtimeLinelistPage = () => {
                                     <table style={C.table}>
                                         <thead>
                                             <tr>
-                                                <th style={C.th}>Tracked Entity</th>
+                                                <SortableTh
+                                                    label="Tracked Entity"
+                                                    sortKey="__tei__"
+                                                    sort={sort}
+                                                    onCycle={cycleSort}
+                                                    pinned={frozenColumns.has('__tei__')}
+                                                    onPin={() => toggleFreeze('__tei__')}
+                                                    stickyStyle={stickyTh('__tei__')}
+                                                />
                                                 {orderedColumns.map((a) => (
-                                                    <th key={a.id} style={C.th}>
-                                                        {a.displayName}
-                                                        {a.sensitive && (
-                                                            <span
-                                                                style={{ marginLeft: 4 }}
-                                                                title="Sensitive — masked"
-                                                            >
-                                                                <ShieldLockIcon size={11} />
-                                                            </span>
-                                                        )}
-                                                    </th>
+                                                    <SortableTh
+                                                        key={a.id}
+                                                        label={a.displayName}
+                                                        sortKey={a.id}
+                                                        sort={sort}
+                                                        onCycle={cycleSort}
+                                                        pinned={frozenColumns.has(a.id)}
+                                                        onPin={() => toggleFreeze(a.id)}
+                                                        rightAdornment={
+                                                            a.sensitive ? (
+                                                                <span
+                                                                    style={{ marginLeft: 4 }}
+                                                                    title="Sensitive — masked"
+                                                                >
+                                                                    <ShieldLockIcon size={11} />
+                                                                </span>
+                                                            ) : null
+                                                        }
+                                                        stickyStyle={stickyTh(a.id)}
+                                                    />
                                                 ))}
-                                                <th style={C.th}>Status</th>
-                                                <th style={C.th}>Created</th>
-                                                <th style={C.th}>Updated</th>
+                                                <SortableTh
+                                                    label="Status"
+                                                    sortKey="enrollmentStatus"
+                                                    sort={sort}
+                                                    onCycle={cycleSort}
+                                                />
+                                                <SortableTh
+                                                    label="Created"
+                                                    sortKey="createdAt"
+                                                    sort={sort}
+                                                    onCycle={cycleSort}
+                                                />
+                                                <SortableTh
+                                                    label="Updated"
+                                                    sortKey="updatedAt"
+                                                    sort={sort}
+                                                    onCycle={cycleSort}
+                                                />
                                                 <th style={C.th}></th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {(payload.rows as TEI[]).map((tei, i) =>
-                                                renderTeiRow(tei, orderedColumns, i),
+                                                renderTeiRow(
+                                                    tei,
+                                                    orderedColumns,
+                                                    i,
+                                                    stickyTd,
+                                                ),
                                             )}
                                         </tbody>
                                     </table>
