@@ -212,6 +212,65 @@ const useDebounced = <T,>(value: T, ms = 350) => {
     return debounced;
 };
 
+const csvEscape = (s: any): string => {
+    if (s == null) return '';
+    const str = String(s);
+    if (/["\n,]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+    return str;
+};
+
+const tsvEscape = (s: any): string => {
+    if (s == null) return '';
+    return String(s).replace(/\t/g, ' ').replace(/\n/g, ' ');
+};
+
+const triggerDownload = (filename: string, mime: string, content: string) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+/**
+ * Vitalworks Pro — flatten one TEI into a record-per-row shape suitable
+ * for CSV/TSV. Mirrors the live-list rendering: TE UID, each visible
+ * column (with optionset code → displayName resolution), enrollment
+ * status, timestamps. Sensitive columns export as the literal token
+ * "[masked]" so the file matches the on-screen disclosure surface.
+ */
+const flattenTei = (
+    tei: TEI,
+    columns: AttrMeta[],
+    sensitiveIds: Set<string>,
+    optionMaps: Record<string, Record<string, string>>,
+) => {
+    const attrByUid: Record<string, string> = {};
+    for (const a of tei.attributes || []) attrByUid[a.attribute] = a.value;
+    const enr = tei.enrollments?.[0];
+    const row: Record<string, any> = {
+        trackedEntity: tei.trackedEntity,
+        orgUnit: tei.orgUnit || '',
+        createdAt: tei.createdAt || '',
+        updatedAt: tei.updatedAt || '',
+        enrollmentStatus: enr?.status || '',
+        enrolledAt: enr?.enrolledAt || '',
+    };
+    for (const c of columns) {
+        const raw = attrByUid[c.id];
+        let val: string;
+        if (sensitiveIds.has(c.id)) val = '[masked]';
+        else if (raw && c.optionMap && c.optionMap[raw] != null) val = c.optionMap[raw];
+        else val = raw || '';
+        row[c.displayName] = val;
+    }
+    return row;
+};
+
 const C: Record<string, React.CSSProperties> = {
     shell: {
         background: T.bg,
@@ -247,22 +306,42 @@ const C: Record<string, React.CSSProperties> = {
         maxHeight: 'calc(100vh - 140px)',
         overflowY: 'auto',
     },
-    statsRow: {
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
-        gap: 10,
-        marginBottom: 12,
+    // Vitalworks Pro — compact context strip. Replaces the 6-tile grid
+    // that wasted vertical space. Renders as a single-line breadcrumb of
+    // program · type · counts · refresh time, with subtle dividers.
+    contextStrip: {
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 0,
+        padding: '8px 12px',
+        marginBottom: 10,
+        background: T.surface,
+        border: `1px solid ${T.border}`,
+        borderRadius: T.radius,
+        fontSize: 12,
+        color: T.textMuted,
+        boxShadow: T.shadow,
     },
+    contextItem: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '2px 10px',
+    },
+    contextLabel: { color: T.textMuted, fontWeight: 500 },
+    contextValue: { color: T.text, fontWeight: 600 },
+    contextDivider: { width: 1, height: 12, background: T.border },
+    // Kept for the "pick a program first" empty-state notice card.
     tile: {
         background: T.surface,
         border: `1px solid ${T.border}`,
         borderRadius: T.radius,
         padding: '10px 12px',
-        fontSize: 12,
-        color: T.textMuted,
-        fontWeight: 500,
+        fontSize: 13,
+        color: T.text,
+        boxShadow: T.shadow,
     },
-    tileValue: { fontWeight: 700, fontSize: 16, color: T.text, marginTop: 4 },
     controlsRow: {
         display: 'flex',
         gap: 8,
@@ -337,24 +416,32 @@ const C: Record<string, React.CSSProperties> = {
     tableScroll: { overflow: 'auto' },
     table: { width: '100%', borderCollapse: 'separate', borderSpacing: 0 },
     th: {
-        padding: '10px 14px',
+        padding: '7px 10px',
         textAlign: 'left',
-        fontSize: 11,
+        fontSize: 10.5,
         fontWeight: 700,
         background: T.bgAlt,
         borderBottom: `1px solid ${T.border}`,
         color: T.textMuted,
         textTransform: 'uppercase',
-        letterSpacing: '0.06em',
+        letterSpacing: '0.05em',
         position: 'sticky',
         top: 0,
+        whiteSpace: 'nowrap',
+        zIndex: 1,
     },
     td: {
-        padding: '10px 14px',
+        padding: '6px 10px',
         borderBottom: `1px solid ${T.bgAlt}`,
-        fontSize: 13,
+        fontSize: 12.5,
         color: T.text,
+        lineHeight: 1.45,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        maxWidth: 240,
     },
+    trZebra: { background: '#FAFBFC' },
     tdSelected: { background: T.brandSoft },
     mono: {
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -703,6 +790,15 @@ export const RealtimeLinelistPage = () => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selectedTei, setSelectedTei] = useState<string | null>(null);
+    const [exportOpen, setExportOpen] = useState(false);
+    const [exportFormat, setExportFormat] = useState<'csv' | 'tsv' | 'json' | 'ndjson'>('csv');
+    const [exportScope, setExportScope] = useState<'page' | 'all'>('page');
+    const [exportIncludeEnrollments, setExportIncludeEnrollments] = useState(true);
+    const [exportIncludeEvents, setExportIncludeEvents] = useState(true);
+    const [exportIncludeRelationships, setExportIncludeRelationships] = useState(false);
+    const [exportIncludeRelatedPrograms, setExportIncludeRelatedPrograms] = useState(false);
+    const [exporting, setExporting] = useState(false);
+    const [exportErr, setExportErr] = useState<string | null>(null);
 
     const meQuery = useDataQuery(ME_QUERY);
     const settingsQuery = useDataQuery(SETTINGS_QUERY);
@@ -889,6 +985,235 @@ export const RealtimeLinelistPage = () => {
             prev.includes(id) ? prev.filter((c) => c !== id) : [...prev, id],
         );
 
+    // Single ordered list used for the header row, the cell row, AND
+    // the export flattener. Eliminates the "column header doesn't match
+    // value" bug we hit when the two loops drifted apart.
+    const orderedColumns: AttrMeta[] = useMemo(() => {
+        const byId: Record<string, AttrMeta> = {};
+        for (const a of attrMeta) byId[a.id] = a;
+        return visibleColumns.map((id) => byId[id]).filter(Boolean);
+    }, [attrMeta, visibleColumns]);
+
+    /**
+     * Vitalworks Pro — export records in the user-chosen format.
+     *
+     * Scope=page reuses what's already on screen (no extra network).
+     * Scope=all walks every page (capped at 5,000 rows server-side) and
+     * lets the user include nested enrollments / events / relationships
+     * (one expensive query, two for related-program enrollments).
+     *
+     * Output:
+     *   csv / tsv → one row per TEI, columns mirror the on-screen
+     *               columns (resolved optionsets, masked PII).
+     *   json     → hierarchical {records: [...], generatedAt, scope,
+     *               program} so the consumer keeps nested data.
+     *   ndjson   → newline-delimited JSON for line-by-line ingest.
+     */
+    const doExport = useCallback(async () => {
+        if (!isReady || !payload || !programMeta) return;
+        setExporting(true);
+        setExportErr(null);
+        try {
+            const isTracker = payload.kind === 'tracker';
+            // Compose the field expression based on what the user opted into.
+            const baseTeiFields =
+                'trackedEntity,trackedEntityType,createdAt,updatedAt,orgUnit,attributes[attribute,displayName,value]';
+            const eventFields = exportIncludeEvents
+                ? 'events[event,programStage,status,occurredAt,createdAt,dataValues[dataElement,value]]'
+                : '';
+            const relFields = exportIncludeRelationships
+                ? 'relationships[relationship,relationshipType,createdAt,from,to]'
+                : '';
+            const enrollmentFields = exportIncludeEnrollments
+                ? `enrollments[enrollment,program,status,enrolledAt,occurredAt${
+                      eventFields ? ',' + eventFields : ''
+                  }${relFields ? ',' + relFields : ''}]`
+                : '';
+            const fields = [baseTeiFields, enrollmentFields].filter(Boolean).join(',');
+
+            let rows: Array<TEI | EventRow> = [];
+            if (exportScope === 'page') {
+                if (isTracker && (exportIncludeEnrollments || exportIncludeRelationships || exportIncludeEvents)) {
+                    // Re-fetch the current page with expanded fields so
+                    // hierarchical sections export with their nested data.
+                    const params: Record<string, any> = {
+                        program: programId,
+                        orgUnit: orgUnitId,
+                        ouMode: 'DESCENDANTS',
+                        page,
+                        pageSize,
+                        order: 'createdAt:desc',
+                        fields,
+                    };
+                    const term = debouncedSearch.trim();
+                    if (term && primaryAttrId && !sensitiveAttrIds.has(primaryAttrId)) {
+                        params.filter = `${primaryAttrId}:LIKE:${term}`;
+                    }
+                    const data: any = await engine.query({
+                        result: { resource: 'tracker/trackedEntities', params },
+                    });
+                    rows = data?.result?.instances || data?.result?.trackedEntities || [];
+                } else {
+                    rows = payload.rows;
+                }
+            } else {
+                // scope === 'all' → page through up to 5000 rows. The
+                // hard cap is a self-guard against accidental whole-org
+                // dumps; users that need full-tenant exports should run
+                // the analytics export pipeline.
+                const HARD_CAP = 5000;
+                const allRows: Array<TEI | EventRow> = [];
+                let p = 1;
+                const pSize = 500;
+                while (allRows.length < HARD_CAP) {
+                    const params: Record<string, any> = {
+                        program: programId,
+                        orgUnit: orgUnitId,
+                        ouMode: 'DESCENDANTS',
+                        page: p,
+                        pageSize: pSize,
+                        order: 'createdAt:desc',
+                        fields: isTracker ? fields : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]',
+                    };
+                    const term = debouncedSearch.trim();
+                    if (isTracker && term && primaryAttrId && !sensitiveAttrIds.has(primaryAttrId)) {
+                        params.filter = `${primaryAttrId}:LIKE:${term}`;
+                    }
+                    const data: any = await engine.query({
+                        result: {
+                            resource: isTracker ? 'tracker/trackedEntities' : 'tracker/events',
+                            params,
+                        },
+                    });
+                    const batch = data?.result?.instances || data?.result?.trackedEntities || data?.result?.events || [];
+                    if (batch.length === 0) break;
+                    allRows.push(...batch);
+                    if (batch.length < pSize) break;
+                    p++;
+                }
+                rows = allRows.slice(0, HARD_CAP);
+            }
+
+            // Optionally enrich each TEI with its other-program
+            // enrollments. Fired in parallel batches of 10 to keep the
+            // total request count bounded.
+            if (isTracker && exportIncludeRelatedPrograms && rows.length > 0) {
+                const teis = rows as TEI[];
+                const seenProgs = new Set<string>([programId]);
+                const fetchOne = async (uid: string) => {
+                    try {
+                        const data: any = await engine.query({
+                            other: {
+                                resource: `tracker/trackedEntities/${uid}`,
+                                params: {
+                                    fields:
+                                        'trackedEntity,enrollments[enrollment,program,status,enrolledAt,occurredAt]',
+                                },
+                            },
+                        });
+                        const others = (data?.other?.enrollments || []).filter(
+                            (e: any) => e.program && !seenProgs.has(e.program),
+                        );
+                        const target = teis.find((t) => t.trackedEntity === uid);
+                        if (target) (target as any).otherProgramEnrollments = others;
+                    } catch {
+                        /* best effort */
+                    }
+                };
+                const BATCH = 10;
+                for (let i = 0; i < teis.length; i += BATCH) {
+                    await Promise.all(teis.slice(i, i + BATCH).map((t) => fetchOne(t.trackedEntity)));
+                }
+            }
+
+            const ts = new Date().toISOString().replace(/[:.]/g, '-');
+            const baseName = `live-records-${programId}-${ts}`;
+
+            if (exportFormat === 'json') {
+                const out = {
+                    generatedAt: new Date().toISOString(),
+                    program: { id: programId, name: programMeta?.displayName, type: programMeta?.programType },
+                    orgUnit: orgUnitId,
+                    scope: exportScope,
+                    include: {
+                        enrollments: exportIncludeEnrollments,
+                        events: exportIncludeEvents,
+                        relationships: exportIncludeRelationships,
+                        relatedPrograms: exportIncludeRelatedPrograms,
+                    },
+                    records: rows,
+                };
+                triggerDownload(`${baseName}.json`, 'application/json', JSON.stringify(out, null, 2));
+            } else if (exportFormat === 'ndjson') {
+                const lines = rows.map((r) => JSON.stringify(r)).join('\n');
+                triggerDownload(`${baseName}.ndjson`, 'application/x-ndjson', lines);
+            } else {
+                // csv / tsv — flatten via the same column ordering shown
+                // on screen so the file matches what the user just saw.
+                const flat = isTracker
+                    ? (rows as TEI[]).map((t) =>
+                          flattenTei(t, orderedColumns, sensitiveAttrIds, optionMaps),
+                      )
+                    : (rows as EventRow[]).map((ev) => ({
+                          event: ev.event,
+                          program: ev.program || '',
+                          programStage: ev.programStage || '',
+                          orgUnit: ev.orgUnit || '',
+                          status: ev.status || '',
+                          occurredAt: ev.occurredAt || '',
+                          createdAt: ev.createdAt || '',
+                          updatedAt: ev.updatedAt || '',
+                          dataValueCount: (ev.dataValues || []).length,
+                      }));
+                if (flat.length === 0) {
+                    triggerDownload(
+                        `${baseName}.${exportFormat}`,
+                        'text/plain',
+                        '(no records to export)',
+                    );
+                } else {
+                    const headers = Object.keys(flat[0]);
+                    const sep = exportFormat === 'tsv' ? '\t' : ',';
+                    const esc = exportFormat === 'tsv' ? tsvEscape : csvEscape;
+                    const lines = [
+                        headers.join(sep),
+                        ...flat.map((row) => headers.map((h) => esc((row as any)[h])).join(sep)),
+                    ];
+                    triggerDownload(
+                        `${baseName}.${exportFormat}`,
+                        exportFormat === 'tsv' ? 'text/tab-separated-values' : 'text/csv',
+                        lines.join('\n'),
+                    );
+                }
+            }
+            setExportOpen(false);
+        } catch (e: any) {
+            setExportErr(e?.message || 'Export failed');
+        } finally {
+            setExporting(false);
+        }
+    }, [
+        isReady,
+        payload,
+        programMeta,
+        programId,
+        orgUnitId,
+        exportFormat,
+        exportScope,
+        exportIncludeEnrollments,
+        exportIncludeEvents,
+        exportIncludeRelationships,
+        exportIncludeRelatedPrograms,
+        engine,
+        page,
+        pageSize,
+        debouncedSearch,
+        primaryAttrId,
+        sensitiveAttrIds,
+        orderedColumns,
+        optionMaps,
+    ]);
+
     const selectedTeiObj = useMemo(
         () =>
             payload?.kind === 'tracker'
@@ -897,9 +1222,10 @@ export const RealtimeLinelistPage = () => {
         [payload, selectedTei],
     );
 
-    const renderTeiRow = (tei: TEI, columns: AttrMeta[]) => {
+    const renderTeiRow = (tei: TEI, columns: AttrMeta[], index: number) => {
         const selected = tei.trackedEntity === selectedTei;
-        const tdStyle = selected ? { ...C.td, ...C.tdSelected } : C.td;
+        const zebra = !selected && index % 2 === 1 ? C.trZebra : {};
+        const tdStyle = selected ? { ...C.td, ...C.tdSelected } : { ...C.td, ...zebra };
         const attrByUid: Record<string, string> = {};
         for (const a of tei.attributes || []) attrByUid[a.attribute] = a.value;
         const e = tei.enrollments?.[0];
@@ -967,14 +1293,6 @@ export const RealtimeLinelistPage = () => {
     );
 
     const pageCount = payload?.pageCount || (payload?.total ? Math.ceil(payload.total / pageSize) : 0);
-    // Single ordered list used for BOTH the header row and the cell row,
-    // in the user-selected order. Eliminates the "column header doesn't
-    // match value" bug we hit when the two loops drifted apart.
-    const orderedColumns: AttrMeta[] = useMemo(() => {
-        const byId: Record<string, AttrMeta> = {};
-        for (const a of attrMeta) byId[a.id] = a;
-        return visibleColumns.map((id) => byId[id]).filter(Boolean);
-    }, [attrMeta, visibleColumns]);
     const showDrawer = payload?.kind === 'tracker' && selectedTei && selectedTeiObj;
     const sensitiveCount = orderedColumns.filter((c) => c.sensitive).length;
 
@@ -1005,38 +1323,50 @@ export const RealtimeLinelistPage = () => {
                     </div>
                 </div>
 
-                <div style={C.statsRow}>
-                    <div style={C.tile}>
-                        Program
-                        <div style={C.tileValue}>
+                <div style={C.contextStrip}>
+                    <span style={C.contextItem}>
+                        <span style={C.contextLabel}>Program</span>
+                        <span style={C.contextValue}>
                             {programMeta?.displayName || programId || '—'}
-                        </div>
-                    </div>
-                    <div style={C.tile}>
-                        Type
-                        <div style={C.tileValue}>{programMeta?.programType || '—'}</div>
-                    </div>
-                    <div style={C.tile}>
-                        Page
-                        <div style={C.tileValue}>
+                        </span>
+                    </span>
+                    <span style={C.contextDivider} />
+                    <span style={C.contextItem}>
+                        <span style={C.contextLabel}>Type</span>
+                        <span style={C.contextValue}>
+                            {programMeta?.programType
+                                ? programMeta.programType.replace('_', ' ').toLowerCase()
+                                : '—'}
+                        </span>
+                    </span>
+                    <span style={C.contextDivider} />
+                    <span style={C.contextItem}>
+                        <span style={C.contextLabel}>Page</span>
+                        <span style={C.contextValue}>
                             {page}
                             {pageCount ? ` / ${pageCount}` : ''}
-                        </div>
-                    </div>
-                    <div style={C.tile}>
-                        Records (page)
-                        <div style={C.tileValue}>{payload?.rows.length ?? '—'}</div>
-                    </div>
-                    <div style={C.tile}>
-                        Total
-                        <div style={C.tileValue}>{payload?.total ?? '—'}</div>
-                    </div>
-                    <div style={C.tile}>
-                        Last refreshed
-                        <div style={C.tileValue}>
-                            {payload?.fetchedAt ? fmtDate(payload.fetchedAt.toISOString()) : '—'}
-                        </div>
-                    </div>
+                        </span>
+                    </span>
+                    <span style={C.contextDivider} />
+                    <span style={C.contextItem}>
+                        <span style={C.contextLabel}>Showing</span>
+                        <span style={C.contextValue}>
+                            {payload?.rows.length ?? 0}
+                            {payload?.total ? ` of ${payload.total}` : ''}
+                        </span>
+                    </span>
+                    <span style={C.contextDivider} />
+                    <span style={C.contextItem}>
+                        <span style={C.contextLabel}>Refreshed</span>
+                        <span style={C.contextValue}>
+                            {payload?.fetchedAt
+                                ? new Date(payload.fetchedAt).toLocaleTimeString(undefined, {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                  })
+                                : '—'}
+                        </span>
+                    </span>
                 </div>
 
                 <div style={{ ...C.controlsRow, position: 'relative' }}>
@@ -1069,6 +1399,16 @@ export const RealtimeLinelistPage = () => {
                         title="Manage columns"
                     >
                         <ColumnsIcon />
+                    </button>
+                    <button
+                        type="button"
+                        style={C.btn}
+                        onClick={() => setExportOpen((v) => !v)}
+                        aria-label="Export records"
+                        title="Export records"
+                        disabled={!payload || payload.rows.length === 0}
+                    >
+                        Export…
                     </button>
                     <button
                         type="button"
@@ -1112,6 +1452,125 @@ export const RealtimeLinelistPage = () => {
                                     </label>
                                 ))
                             )}
+                        </div>
+                    )}
+                    {exportOpen && (
+                        <div style={{ ...C.popover, minWidth: 300 }}>
+                            <div style={{ ...C.drawerSectionTitle, marginBottom: 8 }}>Export</div>
+                            <div style={{ ...C.drawerSectionTitle, marginTop: 6 }}>Format</div>
+                            {(['csv', 'tsv', 'json', 'ndjson'] as const).map((f) => (
+                                <label key={f} style={C.popoverItem}>
+                                    <input
+                                        type="radio"
+                                        name="vw-export-fmt"
+                                        checked={exportFormat === f}
+                                        onChange={() => setExportFormat(f)}
+                                    />
+                                    <span style={{ textTransform: 'uppercase', fontSize: 12 }}>
+                                        {f}
+                                    </span>
+                                    <span style={{ ...C.muted, marginLeft: 6 }}>
+                                        {f === 'csv'
+                                            ? 'comma-separated, opens in Excel / Sheets'
+                                            : f === 'tsv'
+                                            ? 'tab-separated, safest for clipboards'
+                                            : f === 'json'
+                                            ? 'hierarchical, keeps nested sections'
+                                            : 'one JSON record per line (ingest pipelines)'}
+                                    </span>
+                                </label>
+                            ))}
+                            <div style={{ ...C.drawerSectionTitle, marginTop: 10 }}>Scope</div>
+                            {(['page', 'all'] as const).map((s) => (
+                                <label key={s} style={C.popoverItem}>
+                                    <input
+                                        type="radio"
+                                        name="vw-export-scope"
+                                        checked={exportScope === s}
+                                        onChange={() => setExportScope(s)}
+                                    />
+                                    <span>
+                                        {s === 'page'
+                                            ? `Current page (${payload?.rows.length ?? 0} rows)`
+                                            : `All matching records${
+                                                  payload?.total ? ` (≤${Math.min(payload.total, 5000)})` : ''
+                                              }`}
+                                    </span>
+                                </label>
+                            ))}
+                            {payload?.kind === 'tracker' && (exportFormat === 'json' || exportFormat === 'ndjson') && (
+                                <>
+                                    <div style={{ ...C.drawerSectionTitle, marginTop: 10 }}>
+                                        Include nested sections
+                                    </div>
+                                    <label style={C.popoverItem}>
+                                        <input
+                                            type="checkbox"
+                                            checked={exportIncludeEnrollments}
+                                            onChange={() => setExportIncludeEnrollments((v) => !v)}
+                                        />
+                                        <span>Enrollments</span>
+                                    </label>
+                                    <label style={C.popoverItem}>
+                                        <input
+                                            type="checkbox"
+                                            checked={exportIncludeEvents}
+                                            onChange={() => setExportIncludeEvents((v) => !v)}
+                                            disabled={!exportIncludeEnrollments}
+                                        />
+                                        <span>Events (per enrollment)</span>
+                                    </label>
+                                    <label style={C.popoverItem}>
+                                        <input
+                                            type="checkbox"
+                                            checked={exportIncludeRelationships}
+                                            onChange={() => setExportIncludeRelationships((v) => !v)}
+                                            disabled={!exportIncludeEnrollments}
+                                        />
+                                        <span>Relationships</span>
+                                    </label>
+                                    <label style={C.popoverItem}>
+                                        <input
+                                            type="checkbox"
+                                            checked={exportIncludeRelatedPrograms}
+                                            onChange={() => setExportIncludeRelatedPrograms((v) => !v)}
+                                        />
+                                        <span>Other-program enrollments</span>
+                                    </label>
+                                </>
+                            )}
+                            {exportErr && (
+                                <div
+                                    style={{
+                                        marginTop: 8,
+                                        padding: '6px 8px',
+                                        background: T.dangerSoft,
+                                        color: T.danger,
+                                        borderRadius: T.radiusSm,
+                                        fontSize: 12,
+                                    }}
+                                >
+                                    {exportErr}
+                                </div>
+                            )}
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 12 }}>
+                                <button
+                                    type="button"
+                                    style={C.btn}
+                                    onClick={() => setExportOpen(false)}
+                                    disabled={exporting}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    style={C.btnPrimary}
+                                    onClick={doExport}
+                                    disabled={exporting}
+                                >
+                                    {exporting ? 'Exporting…' : 'Export'}
+                                </button>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -1176,8 +1635,8 @@ export const RealtimeLinelistPage = () => {
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {(payload.rows as TEI[]).map((tei) =>
-                                                renderTeiRow(tei, orderedColumns),
+                                            {(payload.rows as TEI[]).map((tei, i) =>
+                                                renderTeiRow(tei, orderedColumns, i),
                                             )}
                                         </tbody>
                                     </table>
