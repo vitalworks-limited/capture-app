@@ -911,6 +911,20 @@ export const RealtimeLinelistPage = () => {
         }
     }, [engine, programId]);
 
+    // Every searchable TEA — sensitive or not. Per product direction
+    // ("any variable marked as searchable MUST be searchable") the
+    // line list honours the metadata flag and includes sensitive
+    // attributes in the fan-out. The displayed cell value remains
+    // masked; the user is only confirming whether a value they
+    // already know matches. The tracker endpoint's `?query=` is
+    // silently dropped on this DHIS2 build, so we fan out one
+    // server-side `filter=<attrId>:LIKE:<term>` per attribute and
+    // union the results client-side.
+    const searchableAttrIds = useMemo(
+        () => attrMeta.filter((a) => a.searchable).map((a) => a.id),
+        [attrMeta],
+    );
+
     const refresh = useCallback(async () => {
         if (!isReady || !programMeta) return;
         setLoading(true);
@@ -921,34 +935,83 @@ export const RealtimeLinelistPage = () => {
             const fields = isTracker
                 ? 'trackedEntity,trackedEntityType,createdAt,updatedAt,orgUnit,attributes[attribute,displayName,value],enrollments[enrollment,status,enrolledAt,occurredAt]'
                 : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]';
-            const params: Record<string, any> = {
+            const baseParams: Record<string, any> = {
                 program: programId,
                 orgUnit: orgUnitId,
                 ouMode: 'DESCENDANTS',
-                page,
-                pageSize,
-                totalPages: true,
                 order: 'createdAt:desc',
                 fields,
             };
             const term = debouncedSearch.trim();
-            if (isTracker && term && primaryAttrId) {
-                // Don't push a sensitive value into the query string; the
-                // line list always masks PII/protected attributes, so
-                // searching by one would leak the cleartext into the URL
-                // and access logs.
-                if (!sensitiveAttrIds.has(primaryAttrId)) {
-                    params.filter = `${primaryAttrId}:LIKE:${term}`;
+
+            // === No search term: single paginated query (existing path) ===
+            if (!isTracker || !term || searchableAttrIds.length === 0) {
+                const params = {
+                    ...baseParams,
+                    page,
+                    pageSize,
+                    totalPages: true,
+                };
+                const data: any = await engine.query({ result: { resource, params } });
+                const r = data?.result || {};
+                const rows = r.instances || r.trackedEntities || r.events || [];
+                setPayload({
+                    kind: isTracker ? 'tracker' : 'event',
+                    rows,
+                    total: r.total,
+                    pageCount: r.pageCount,
+                    page,
+                    pageSize,
+                    fetchedAt: new Date(),
+                });
+                return;
+            }
+
+            // === Search term: fan out across every searchable, non-sensitive
+            // attribute and union by trackedEntity UID. ===
+            const perAttrLimit = 200;
+            const results = await Promise.allSettled(
+                searchableAttrIds.map((attrId) =>
+                    engine.query({
+                        result: {
+                            resource,
+                            params: {
+                                ...baseParams,
+                                page: 1,
+                                pageSize: perAttrLimit,
+                                filter: `${attrId}:LIKE:${term}`,
+                            },
+                        },
+                    }),
+                ),
+            );
+            const seen = new Set<string>();
+            const merged: TEI[] = [];
+            for (const r of results) {
+                if (r.status !== 'fulfilled') continue;
+                const data: any = r.value;
+                const rows: TEI[] =
+                    data?.result?.instances || data?.result?.trackedEntities || [];
+                for (const row of rows) {
+                    if (!row.trackedEntity || seen.has(row.trackedEntity)) continue;
+                    seen.add(row.trackedEntity);
+                    merged.push(row);
                 }
             }
-            const data: any = await engine.query({ result: { resource, params } });
-            const r = data?.result || {};
-            const rows = r.instances || r.trackedEntities || r.events || [];
+            merged.sort((a, b) =>
+                (b.createdAt || '').localeCompare(a.createdAt || ''),
+            );
+            // Apply client-side pagination on the merged set so the pager
+            // controls continue to work for big result sets.
+            const total = merged.length;
+            const pageStart = (page - 1) * pageSize;
+            const pageRows = merged.slice(pageStart, pageStart + pageSize);
+            const pageCount = Math.max(1, Math.ceil(total / pageSize));
             setPayload({
-                kind: isTracker ? 'tracker' : 'event',
-                rows,
-                total: r.total,
-                pageCount: r.pageCount,
+                kind: 'tracker',
+                rows: pageRows,
+                total,
+                pageCount,
                 page,
                 pageSize,
                 fetchedAt: new Date(),
@@ -958,7 +1021,7 @@ export const RealtimeLinelistPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, sensitiveAttrIds, page, pageSize]);
+    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, searchableAttrIds, page, pageSize]);
 
     useEffect(() => {
         loadProgram();
@@ -971,14 +1034,14 @@ export const RealtimeLinelistPage = () => {
         return () => window.clearInterval(id);
     }, [isReady, programMeta, refresh]);
 
-    const primaryAttrLabel = useMemo(() => {
-        if (!primaryAttrId) return 'attribute';
-        return attrMeta.find((a) => a.id === primaryAttrId)?.displayName || 'attribute';
-    }, [primaryAttrId, attrMeta]);
-
-    // Search is disabled when the primary searchable attribute is itself
-    // sensitive — typing the cleartext into the URL would leak it.
-    const searchProtectedBlocked = !!primaryAttrId && sensitiveAttrIds.has(primaryAttrId);
+    // Search input is disabled only when the program has zero searchable
+    // attributes. Otherwise the fan-out covers all of them.
+    const searchProtectedBlocked = searchableAttrIds.length === 0;
+    const searchPlaceholder = searchProtectedBlocked
+        ? 'Search disabled — no searchable attributes on this program'
+        : `Search across ${searchableAttrIds.length} attribute${
+              searchableAttrIds.length === 1 ? '' : 's'
+          }…`;
 
     const toggleColumn = (id: string) =>
         setVisibleColumns((prev) =>
@@ -1032,36 +1095,90 @@ export const RealtimeLinelistPage = () => {
             const fields = [baseTeiFields, enrollmentFields].filter(Boolean).join(',');
 
             let rows: Array<TEI | EventRow> = [];
+            const term = debouncedSearch.trim();
+            const HARD_CAP = 5000;
+
             if (exportScope === 'page') {
                 if (isTracker && (exportIncludeEnrollments || exportIncludeRelationships || exportIncludeEvents)) {
-                    // Re-fetch the current page with expanded fields so
-                    // hierarchical sections export with their nested data.
-                    const params: Record<string, any> = {
-                        program: programId,
-                        orgUnit: orgUnitId,
-                        ouMode: 'DESCENDANTS',
-                        page,
-                        pageSize,
-                        order: 'createdAt:desc',
-                        fields,
-                    };
-                    const term = debouncedSearch.trim();
-                    if (term && primaryAttrId && !sensitiveAttrIds.has(primaryAttrId)) {
-                        params.filter = `${primaryAttrId}:LIKE:${term}`;
+                    // Re-fetch each TEI on the current page individually
+                    // with expanded fields. Single-UID lookups bypass the
+                    // multi-attribute search problem and keep the export
+                    // grouped exactly as it appears on screen.
+                    const uids = (payload.rows as TEI[])
+                        .map((t) => t.trackedEntity)
+                        .filter(Boolean);
+                    const fetched: TEI[] = [];
+                    const BATCH = 10;
+                    for (let i = 0; i < uids.length; i += BATCH) {
+                        const slice = uids.slice(i, i + BATCH);
+                        const settled = await Promise.allSettled(
+                            slice.map((uid) =>
+                                engine.query({
+                                    tei: {
+                                        resource: `tracker/trackedEntities/${uid}`,
+                                        params: { fields },
+                                    },
+                                }),
+                            ),
+                        );
+                        for (const r of settled) {
+                            if (r.status === 'fulfilled') {
+                                const data: any = r.value;
+                                if (data?.tei) fetched.push(data.tei);
+                            }
+                        }
                     }
-                    const data: any = await engine.query({
-                        result: { resource: 'tracker/trackedEntities', params },
-                    });
-                    rows = data?.result?.instances || data?.result?.trackedEntities || [];
+                    rows = fetched;
                 } else {
                     rows = payload.rows;
                 }
+            } else if (isTracker && term && searchableAttrIds.length > 0) {
+                // scope === 'all' with a search term → fan out across
+                // every searchable, non-sensitive attribute and union.
+                const perAttrLimit = 1000;
+                const settled = await Promise.allSettled(
+                    searchableAttrIds.map((attrId) =>
+                        engine.query({
+                            result: {
+                                resource: 'tracker/trackedEntities',
+                                params: {
+                                    program: programId,
+                                    orgUnit: orgUnitId,
+                                    ouMode: 'DESCENDANTS',
+                                    page: 1,
+                                    pageSize: perAttrLimit,
+                                    order: 'createdAt:desc',
+                                    fields,
+                                    filter: `${attrId}:LIKE:${term}`,
+                                },
+                            },
+                        }),
+                    ),
+                );
+                const seen = new Set<string>();
+                const merged: TEI[] = [];
+                for (const r of settled) {
+                    if (r.status !== 'fulfilled') continue;
+                    const data: any = r.value;
+                    const batch: TEI[] =
+                        data?.result?.instances || data?.result?.trackedEntities || [];
+                    for (const row of batch) {
+                        if (!row.trackedEntity || seen.has(row.trackedEntity)) continue;
+                        seen.add(row.trackedEntity);
+                        merged.push(row);
+                        if (merged.length >= HARD_CAP) break;
+                    }
+                    if (merged.length >= HARD_CAP) break;
+                }
+                merged.sort((a, b) =>
+                    (b.createdAt || '').localeCompare(a.createdAt || ''),
+                );
+                rows = merged;
             } else {
-                // scope === 'all' → page through up to 5000 rows. The
-                // hard cap is a self-guard against accidental whole-org
-                // dumps; users that need full-tenant exports should run
-                // the analytics export pipeline.
-                const HARD_CAP = 5000;
+                // scope === 'all', no search → walk pages of 500 up to the
+                // 5000-row hard cap. Same self-guard rationale: users that
+                // need whole-tenant exports should use the analytics
+                // export pipeline.
                 const allRows: Array<TEI | EventRow> = [];
                 let p = 1;
                 const pSize = 500;
@@ -1073,19 +1190,21 @@ export const RealtimeLinelistPage = () => {
                         page: p,
                         pageSize: pSize,
                         order: 'createdAt:desc',
-                        fields: isTracker ? fields : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]',
+                        fields: isTracker
+                            ? fields
+                            : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]',
                     };
-                    const term = debouncedSearch.trim();
-                    if (isTracker && term && primaryAttrId && !sensitiveAttrIds.has(primaryAttrId)) {
-                        params.filter = `${primaryAttrId}:LIKE:${term}`;
-                    }
                     const data: any = await engine.query({
                         result: {
                             resource: isTracker ? 'tracker/trackedEntities' : 'tracker/events',
                             params,
                         },
                     });
-                    const batch = data?.result?.instances || data?.result?.trackedEntities || data?.result?.events || [];
+                    const batch =
+                        data?.result?.instances ||
+                        data?.result?.trackedEntities ||
+                        data?.result?.events ||
+                        [];
                     if (batch.length === 0) break;
                     allRows.push(...batch);
                     if (batch.length < pSize) break;
@@ -1208,7 +1327,7 @@ export const RealtimeLinelistPage = () => {
         page,
         pageSize,
         debouncedSearch,
-        primaryAttrId,
+        searchableAttrIds,
         sensitiveAttrIds,
         orderedColumns,
         optionMaps,
@@ -1373,14 +1492,10 @@ export const RealtimeLinelistPage = () => {
                     <input
                         type="search"
                         style={C.search}
-                        placeholder={
-                            searchProtectedBlocked
-                                ? `Search disabled — ${primaryAttrLabel} is a protected field`
-                                : `Search by ${primaryAttrLabel}…`
-                        }
+                        placeholder={searchPlaceholder}
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
-                        disabled={!isReady || !primaryAttrId || searchProtectedBlocked}
+                        disabled={!isReady || searchProtectedBlocked}
                         aria-label="Search records"
                     />
                     <button
