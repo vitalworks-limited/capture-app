@@ -1,25 +1,32 @@
 /*
  * Vitalworks Pro — realtime line listing.
  *
- * Reads directly from the tracker operational tables via
- * /api/tracker/trackedEntities and /api/tracker/events. No analytics
- * dependency: rows appear the moment a TEI/event is persisted, so an
- * implementer who just loaded a batch of test records can immediately
- * verify they landed without waiting for the analytics tables to refresh.
+ * Reads /api/tracker/trackedEntities (or /api/tracker/events) directly.
+ * No analytics dependency: rows appear the moment a TEI/event is
+ * persisted, so an implementer who just loaded a batch of test records
+ * can immediately verify they landed without waiting for the analytics
+ * tables to refresh.
+ *
+ * Layout:
+ *   - Capture scope-selector TopBar (program / org-unit / category) so
+ *     the user can re-pick context without leaving the page
+ *   - ProtectedDataNotice banner when keyProtectedFieldsEnabled = true
+ *   - Stats tiles, search input, refresh controls
+ *   - Server-filtered table; sensitive (isProtected) attributes are
+ *     masked for users without F_VIEW_PROTECTED_DATA / ALL.
  *
  * Mounted at hash route #/linelist?programId=…&orgUnitId=… and reachable
  * via the "Live records" button on the MainPage TopBar.
- *
- * Plain-HTML implementation (no @dhis2/ui imports) because pulling in
- * the design-system table component dragged a second copy of
- * @tanstack/react-query into the bundle and broke QueryClient context.
  */
-import React, { useCallback, useEffect, useState } from 'react';
-import { useDataEngine } from '@dhis2/app-runtime';
-import { useLocation, useHistory } from 'react-router-dom';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useDataEngine, useDataQuery } from '@dhis2/app-runtime';
+import { useHistory } from 'react-router-dom';
+import { useLocationQuery } from 'capture-core/utils/routing';
+import { TopBar } from 'capture-core/components/Pages/MainPage/TopBar';
 
 const POLL_MS = 10_000;
 const PAGE_SIZE = 50;
+const F_VIEW_PROTECTED_DATA = 'F_VIEW_PROTECTED_DATA';
 
 type Attribute = { attribute: string; displayName?: string; value: string };
 type Enrollment = { enrollment: string; status: string; enrolledAt: string; occurredAt?: string };
@@ -49,16 +56,10 @@ type FetchedPayload = {
     total?: number;
     fetchedAt: Date;
 };
-
-const parseQuery = (search: string) => {
-    const out: Record<string, string> = {};
-    const s = search.startsWith('?') ? search.slice(1) : search;
-    for (const pair of s.split('&')) {
-        if (!pair) continue;
-        const [k, v = ''] = pair.split('=');
-        out[decodeURIComponent(k)] = decodeURIComponent(v);
-    }
-    return out;
+type AttrMeta = {
+    id: string;
+    displayName: string;
+    isProtected: boolean;
 };
 
 const fmtDate = (iso?: string) => {
@@ -76,6 +77,15 @@ const fmtDate = (iso?: string) => {
     }
 };
 
+const useDebounced = <T,>(value: T, ms = 350) => {
+    const [debounced, setDebounced] = useState(value);
+    useEffect(() => {
+        const id = window.setTimeout(() => setDebounced(value), ms);
+        return () => window.clearTimeout(id);
+    }, [value, ms]);
+    return debounced;
+};
+
 const C = {
     page: { padding: 16, maxWidth: 1400, margin: '0 auto', fontFamily: 'inherit' } as React.CSSProperties,
     headerRow: {
@@ -88,6 +98,13 @@ const C = {
     } as React.CSSProperties,
     title: { fontSize: 20, fontWeight: 600, color: '#1F2937', margin: 0 } as React.CSSProperties,
     subtitle: { fontSize: 13, color: '#6B7280', marginTop: 2 } as React.CSSProperties,
+    controlsRow: {
+        display: 'flex',
+        gap: 8,
+        alignItems: 'center',
+        marginBottom: 12,
+        flexWrap: 'wrap' as const,
+    } as React.CSSProperties,
     statsRow: { display: 'flex', gap: 12, marginBottom: 12, flexWrap: 'wrap' as const } as React.CSSProperties,
     tile: {
         background: '#F3F4F6',
@@ -99,7 +116,6 @@ const C = {
         minWidth: 120,
     } as React.CSSProperties,
     tileValue: { fontWeight: 600, fontSize: 15, color: '#111827', marginTop: 2 } as React.CSSProperties,
-    btnRow: { display: 'flex', gap: 8, alignItems: 'center' } as React.CSSProperties,
     btn: {
         background: '#fff',
         color: '#1F4E79',
@@ -119,6 +135,16 @@ const C = {
         fontSize: 13,
         cursor: 'pointer',
         fontWeight: 500,
+    } as React.CSSProperties,
+    search: {
+        flex: 1,
+        minWidth: 220,
+        padding: '6px 10px',
+        fontSize: 13,
+        border: '1px solid #D1D5DB',
+        borderRadius: 4,
+        background: '#fff',
+        color: '#1F2937',
     } as React.CSSProperties,
     notice: {
         padding: '12px 14px',
@@ -164,6 +190,16 @@ const C = {
     } as React.CSSProperties,
     mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 } as React.CSSProperties,
     muted: { color: '#6B7280', fontSize: 12 } as React.CSSProperties,
+    masked: {
+        display: 'inline-block',
+        padding: '2px 6px',
+        borderRadius: 3,
+        background: '#F3F4F6',
+        color: '#6B7280',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 12,
+        letterSpacing: '0.1em',
+    } as React.CSSProperties,
     pill: {
         display: 'inline-block',
         padding: '2px 8px',
@@ -182,22 +218,57 @@ const pillFor = (status?: string) => {
     return { ...C.pill, background: '#F3F4F6', color: '#374151' };
 };
 
+const ME_QUERY = {
+    me: { resource: 'me', params: { fields: 'authorities' } },
+} as const;
+
+const SETTINGS_QUERY: any = {
+    settings: {
+        resource: 'systemSettings',
+        params: {
+            key: ['keyProtectedFieldsEnabled'],
+        },
+    },
+};
+
 export const RealtimeLinelistPage = () => {
     const engine = useDataEngine();
-    const location = useLocation();
     const history = useHistory();
-    const { programId = '', orgUnitId = '' } = parseQuery(location.search);
+    const { programId = '', orgUnitId = '' } = useLocationQuery() || {};
+    const isReady = Boolean(programId && orgUnitId);
 
     const [payload, setPayload] = useState<FetchedPayload | null>(null);
     const [programMeta, setProgramMeta] = useState<any | null>(null);
+    const [attrMeta, setAttrMeta] = useState<AttrMeta[]>([]);
+    const [primaryAttrId, setPrimaryAttrId] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [search, setSearch] = useState('');
+    const debouncedSearch = useDebounced(search, 350);
 
-    const isReady = Boolean(programId && orgUnitId);
+    const meQuery = useDataQuery(ME_QUERY);
+    const settingsQuery = useDataQuery(SETTINGS_QUERY);
+
+    const protectedFieldsEnabled = useMemo(() => {
+        const v = (settingsQuery.data as any)?.settings?.keyProtectedFieldsEnabled;
+        return v === true || v === 'true';
+    }, [settingsQuery.data]);
+
+    const canRevealProtected = useMemo(() => {
+        const auths: string[] = ((meQuery.data as any)?.me?.authorities as string[]) || [];
+        return auths.includes('ALL') || auths.includes(F_VIEW_PROTECTED_DATA);
+    }, [meQuery.data]);
+
+    const protectedAttrIds = useMemo(() => {
+        if (!protectedFieldsEnabled) return new Set<string>();
+        return new Set(attrMeta.filter((a) => a.isProtected).map((a) => a.id));
+    }, [attrMeta, protectedFieldsEnabled]);
 
     const loadProgram = useCallback(async () => {
         if (!programId) {
             setProgramMeta(null);
+            setAttrMeta([]);
+            setPrimaryAttrId(null);
             return;
         }
         try {
@@ -206,11 +277,31 @@ export const RealtimeLinelistPage = () => {
                     resource: 'programs',
                     id: programId,
                     params: {
-                        fields: 'id,displayName,programType,trackedEntityType[id,displayName]',
+                        fields:
+                            'id,displayName,programType,trackedEntityType[id,displayName],programTrackedEntityAttributes[searchable,displayInList,trackedEntityAttribute[id,displayName,isProtected]]',
                     },
                 },
             });
-            setProgramMeta(data?.program);
+            const prog = data?.program;
+            setProgramMeta(prog);
+            const attrs: AttrMeta[] = (prog?.programTrackedEntityAttributes || [])
+                .map((p: any) => p?.trackedEntityAttribute)
+                .filter(Boolean)
+                .map((a: any) => ({
+                    id: a.id,
+                    displayName: a.displayName,
+                    isProtected: !!a.isProtected,
+                }));
+            setAttrMeta(attrs);
+            // Primary searchable attribute = first searchable (or first
+            // displayInList, or just the first attribute).
+            const ordered = (prog?.programTrackedEntityAttributes || []) as Array<any>;
+            const primary =
+                ordered.find((p) => p?.searchable)?.trackedEntityAttribute?.id ||
+                ordered.find((p) => p?.displayInList)?.trackedEntityAttribute?.id ||
+                ordered[0]?.trackedEntityAttribute?.id ||
+                null;
+            setPrimaryAttrId(primary);
         } catch {
             setProgramMeta(null);
         }
@@ -226,18 +317,27 @@ export const RealtimeLinelistPage = () => {
             const fields = isTracker
                 ? 'trackedEntity,trackedEntityType,createdAt,updatedAt,orgUnit,attributes[attribute,displayName,value],enrollments[enrollment,status,enrolledAt,occurredAt]'
                 : 'event,program,programStage,orgUnit,status,occurredAt,createdAt,updatedAt,dataValues[dataElement,value]';
+            const params: Record<string, any> = {
+                program: programId,
+                orgUnit: orgUnitId,
+                ouMode: 'DESCENDANTS',
+                pageSize: PAGE_SIZE,
+                order: 'createdAt:desc',
+                fields,
+            };
+            // Server-side filter on the primary attribute (tracker only).
+            // Skip when a sensitive attr is primary and the user lacks
+            // F_VIEW_PROTECTED_DATA — searching a masked field would
+            // leak the value via the URL.
+            const term = debouncedSearch.trim();
+            if (isTracker && term && primaryAttrId) {
+                const protectedHit = protectedAttrIds.has(primaryAttrId);
+                if (!protectedHit || canRevealProtected) {
+                    params.filter = `${primaryAttrId}:LIKE:${term}`;
+                }
+            }
             const data: any = await engine.query({
-                result: {
-                    resource,
-                    params: {
-                        program: programId,
-                        orgUnit: orgUnitId,
-                        ouMode: 'DESCENDANTS',
-                        pageSize: PAGE_SIZE,
-                        order: 'createdAt:desc',
-                        fields,
-                    },
-                },
+                result: { resource, params },
             });
             const r = data?.result || {};
             const rows = r.instances || r.trackedEntities || r.events || [];
@@ -252,7 +352,7 @@ export const RealtimeLinelistPage = () => {
         } finally {
             setLoading(false);
         }
-    }, [engine, programMeta, isReady, programId, orgUnitId]);
+    }, [engine, programMeta, isReady, programId, orgUnitId, debouncedSearch, primaryAttrId, protectedAttrIds, canRevealProtected]);
 
     useEffect(() => {
         loadProgram();
@@ -265,15 +365,26 @@ export const RealtimeLinelistPage = () => {
         return () => window.clearInterval(id);
     }, [isReady, programMeta, refresh]);
 
+    const renderAttrValue = (attribute: string, value?: string) => {
+        if (!value) return <span style={C.muted}>—</span>;
+        if (protectedAttrIds.has(attribute) && !canRevealProtected) {
+            return <span style={C.masked} title="Protected — value masked">••••••</span>;
+        }
+        return value;
+    };
+
     const renderTei = (tei: TEI) => {
-        const primary = tei.attributes?.[0];
+        const primaryAttrVal = primaryAttrId
+            ? tei.attributes?.find((a) => a.attribute === primaryAttrId)
+            : tei.attributes?.[0];
+        const primaryId = primaryAttrId || primaryAttrVal?.attribute || '';
         const e = tei.enrollments?.[0];
         return (
             <tr key={tei.trackedEntity}>
                 <td style={C.td}>
                     <span style={C.mono}>{tei.trackedEntity}</span>
                 </td>
-                <td style={C.td}>{primary?.value || <span style={C.muted}>—</span>}</td>
+                <td style={C.td}>{renderAttrValue(primaryId, primaryAttrVal?.value)}</td>
                 <td style={C.td}>
                     {e ? <span style={pillFor(e.status)}>{e.status}</span> : <span style={C.muted}>—</span>}
                 </td>
@@ -319,16 +430,67 @@ export const RealtimeLinelistPage = () => {
         </tr>
     );
 
+    const primaryAttrLabel = useMemo(() => {
+        if (!primaryAttrId) return 'attribute';
+        return (
+            attrMeta.find((a) => a.id === primaryAttrId)?.displayName || 'attribute'
+        );
+    }, [primaryAttrId, attrMeta]);
+    const searchDisabled = !isReady || (!primaryAttrId);
+    const searchProtectedBlocked =
+        !!primaryAttrId &&
+        protectedAttrIds.has(primaryAttrId) &&
+        !canRevealProtected;
+
     return (
-        <div style={C.page}>
-            <div style={C.headerRow}>
-                <div>
-                    <h2 style={C.title}>Live records</h2>
-                    <div style={C.subtitle}>
-                        Realtime line listing — reads tracker tables directly, refreshes every {POLL_MS / 1000}s.
+        <>
+            <TopBar programId={programId} orgUnitId={orgUnitId} selectedCategories={undefined} />
+            <div style={C.page}>
+                {protectedFieldsEnabled && (
+                    <div
+                        data-test="linelist-protected-data-notice"
+                        style={{
+                            padding: '10px 14px',
+                            background: '#FFFBEB',
+                            border: '1px solid #FCD34D',
+                            color: '#92400E',
+                            borderRadius: 6,
+                            marginBottom: 12,
+                            fontSize: 13,
+                        }}
+                    >
+                        <strong>Protected data settings active.</strong>{' '}
+                        Sensitive attributes are masked
+                        {canRevealProtected
+                            ? ' until you open the record.'
+                            : ' — you don\'t have F_VIEW_PROTECTED_DATA, so values won\'t be revealed here.'}
+                    </div>
+                )}
+
+                <div style={C.headerRow}>
+                    <div>
+                        <h2 style={C.title}>Live records</h2>
+                        <div style={C.subtitle}>
+                            Realtime line listing — reads tracker tables directly, refreshes every{' '}
+                            {POLL_MS / 1000}s.
+                        </div>
                     </div>
                 </div>
-                <div style={C.btnRow}>
+
+                <div style={C.controlsRow}>
+                    <input
+                        type="search"
+                        style={C.search}
+                        placeholder={
+                            searchProtectedBlocked
+                                ? `Search disabled — ${primaryAttrLabel} is a protected field`
+                                : `Search by ${primaryAttrLabel}…`
+                        }
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                        disabled={searchDisabled || searchProtectedBlocked}
+                        aria-label="Search records"
+                    />
                     <button
                         type="button"
                         style={C.btn}
@@ -341,7 +503,7 @@ export const RealtimeLinelistPage = () => {
                         style={C.btn}
                         onClick={() => history.push(`/search?programId=${programId}`)}
                     >
-                        Search
+                        Advanced search
                     </button>
                     <button
                         type="button"
@@ -352,85 +514,91 @@ export const RealtimeLinelistPage = () => {
                         {loading ? 'Refreshing…' : 'Refresh now'}
                     </button>
                 </div>
-            </div>
 
-            {!isReady && (
-                <div style={C.notice}>
-                    Pick a program and org unit first — append <code>?programId=…&orgUnitId=…</code> to the URL
-                    or open this page via the "Live records" link on the working list.
-                </div>
-            )}
+                {!isReady && (
+                    <div style={C.notice}>
+                        Pick a program and org unit in the bar above (or append{' '}
+                        <code>?programId=…&orgUnitId=…</code> to the URL).
+                    </div>
+                )}
 
-            {error && <div style={C.error}>Could not load records: {error}</div>}
+                {error && <div style={C.error}>Could not load records: {error}</div>}
 
-            <div style={C.statsRow}>
-                <div style={C.tile}>
-                    Program
-                    <div style={C.tileValue}>{programMeta?.displayName || programId || '—'}</div>
-                </div>
-                <div style={C.tile}>
-                    Type
-                    <div style={C.tileValue}>{programMeta?.programType || '—'}</div>
-                </div>
-                <div style={C.tile}>
-                    Org unit
-                    <div style={C.tileValue} title={orgUnitId}>
-                        {orgUnitId || '—'}
+                <div style={C.statsRow}>
+                    <div style={C.tile}>
+                        Program
+                        <div style={C.tileValue}>
+                            {programMeta?.displayName || programId || '—'}
+                        </div>
+                    </div>
+                    <div style={C.tile}>
+                        Type
+                        <div style={C.tileValue}>{programMeta?.programType || '—'}</div>
+                    </div>
+                    <div style={C.tile}>
+                        Org unit
+                        <div style={C.tileValue} title={orgUnitId}>
+                            {orgUnitId || '—'}
+                        </div>
+                    </div>
+                    <div style={C.tile}>
+                        Records (this page)
+                        <div style={C.tileValue}>{payload?.rows.length ?? '—'}</div>
+                    </div>
+                    <div style={C.tile}>
+                        Total
+                        <div style={C.tileValue}>{payload?.total ?? '—'}</div>
+                    </div>
+                    <div style={C.tile}>
+                        Last refreshed
+                        <div style={C.tileValue}>
+                            {payload?.fetchedAt ? fmtDate(payload.fetchedAt.toISOString()) : '—'}
+                        </div>
                     </div>
                 </div>
-                <div style={C.tile}>
-                    Records (this page)
-                    <div style={C.tileValue}>{payload?.rows.length ?? '—'}</div>
-                </div>
-                <div style={C.tile}>
-                    Total
-                    <div style={C.tileValue}>{payload?.total ?? '—'}</div>
-                </div>
-                <div style={C.tile}>
-                    Last refreshed
-                    <div style={C.tileValue}>
-                        {payload?.fetchedAt ? fmtDate(payload.fetchedAt.toISOString()) : '—'}
-                    </div>
-                </div>
-            </div>
 
-            <div style={C.tableWrap}>
-                {!payload && loading ? (
-                    <div style={C.empty}>Loading…</div>
-                ) : payload && payload.rows.length === 0 ? (
-                    <div style={C.empty}>No records match this program / org unit yet.</div>
-                ) : payload && payload.kind === 'tracker' ? (
-                    <table style={C.table}>
-                        <thead>
-                            <tr>
-                                <th style={C.th}>Tracked Entity</th>
-                                <th style={C.th}>Primary attribute</th>
-                                <th style={C.th}>Status</th>
-                                <th style={C.th}>Enrolled at</th>
-                                <th style={C.th}>Created</th>
-                                <th style={C.th}>Last updated</th>
-                                <th style={C.th}></th>
-                            </tr>
-                        </thead>
-                        <tbody>{(payload.rows as TEI[]).map(renderTei)}</tbody>
-                    </table>
-                ) : payload && payload.kind === 'event' ? (
-                    <table style={C.table}>
-                        <thead>
-                            <tr>
-                                <th style={C.th}>Event</th>
-                                <th style={C.th}>Status</th>
-                                <th style={C.th}>Occurred at</th>
-                                <th style={C.th}>Created</th>
-                                <th style={C.th}>Last updated</th>
-                                <th style={C.th}>Data values</th>
-                                <th style={C.th}></th>
-                            </tr>
-                        </thead>
-                        <tbody>{(payload.rows as Event[]).map(renderEvent)}</tbody>
-                    </table>
-                ) : null}
+                <div style={C.tableWrap}>
+                    {!payload && loading ? (
+                        <div style={C.empty}>Loading…</div>
+                    ) : payload && payload.rows.length === 0 ? (
+                        <div style={C.empty}>
+                            {debouncedSearch
+                                ? 'No records match the current search.'
+                                : 'No records match this program / org unit yet.'}
+                        </div>
+                    ) : payload && payload.kind === 'tracker' ? (
+                        <table style={C.table}>
+                            <thead>
+                                <tr>
+                                    <th style={C.th}>Tracked Entity</th>
+                                    <th style={C.th}>{primaryAttrLabel}</th>
+                                    <th style={C.th}>Status</th>
+                                    <th style={C.th}>Enrolled at</th>
+                                    <th style={C.th}>Created</th>
+                                    <th style={C.th}>Last updated</th>
+                                    <th style={C.th}></th>
+                                </tr>
+                            </thead>
+                            <tbody>{(payload.rows as TEI[]).map(renderTei)}</tbody>
+                        </table>
+                    ) : payload && payload.kind === 'event' ? (
+                        <table style={C.table}>
+                            <thead>
+                                <tr>
+                                    <th style={C.th}>Event</th>
+                                    <th style={C.th}>Status</th>
+                                    <th style={C.th}>Occurred at</th>
+                                    <th style={C.th}>Created</th>
+                                    <th style={C.th}>Last updated</th>
+                                    <th style={C.th}>Data values</th>
+                                    <th style={C.th}></th>
+                                </tr>
+                            </thead>
+                            <tbody>{(payload.rows as Event[]).map(renderEvent)}</tbody>
+                        </table>
+                    ) : null}
+                </div>
             </div>
-        </div>
+        </>
     );
 };
