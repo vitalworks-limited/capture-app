@@ -1146,35 +1146,64 @@ export const RealtimeLinelistPage = () => {
                 return;
             }
 
-            // === Search term: fan out across every searchable, non-sensitive
-            // attribute and union by trackedEntity UID. ===
+            // === Search term: tokenize by whitespace, fan out across
+            // every searchable attribute *per token*, then intersect the
+            // per-token result sets. The intersection lets different
+            // tokens match different attributes — "Gakuru Conteh"
+            // matches TEIs where one token hits First name and the other
+            // hits Last name. Each token uses case-insensitive LIKE so
+            // partials still match (`gak` finds Gakuru). ===
+            const tokens = term
+                .split(/\s+/)
+                .map((t) => t.trim())
+                .filter(Boolean);
             const perAttrLimit = 200;
-            const results = await Promise.allSettled(
-                searchableAttrIds.map((attrId) =>
-                    engine.query({
-                        result: {
-                            resource,
-                            params: {
-                                ...baseParams,
-                                page: 1,
-                                pageSize: perAttrLimit,
-                                filter: `${attrId}:LIKE:${term}`,
-                            },
-                        },
-                    }),
-                ),
+            const tokenResultMaps = await Promise.all(
+                tokens.map(async (tok) => {
+                    const settled = await Promise.allSettled(
+                        searchableAttrIds.map((attrId) =>
+                            engine.query({
+                                result: {
+                                    resource,
+                                    params: {
+                                        ...baseParams,
+                                        page: 1,
+                                        pageSize: perAttrLimit,
+                                        filter: `${attrId}:LIKE:${tok}`,
+                                    },
+                                },
+                            }),
+                        ),
+                    );
+                    const byUid = new Map<string, TEI>();
+                    for (const r of settled) {
+                        if (r.status !== 'fulfilled') continue;
+                        const data: any = r.value;
+                        const rows: TEI[] =
+                            data?.result?.instances ||
+                            data?.result?.trackedEntities ||
+                            [];
+                        for (const row of rows) {
+                            if (row.trackedEntity && !byUid.has(row.trackedEntity)) {
+                                byUid.set(row.trackedEntity, row);
+                            }
+                        }
+                    }
+                    return byUid;
+                }),
             );
-            const seen = new Set<string>();
+
+            // Intersect — a TEI must appear in EVERY token's result map.
             const merged: TEI[] = [];
-            for (const r of results) {
-                if (r.status !== 'fulfilled') continue;
-                const data: any = r.value;
-                const rows: TEI[] =
-                    data?.result?.instances || data?.result?.trackedEntities || [];
-                for (const row of rows) {
-                    if (!row.trackedEntity || seen.has(row.trackedEntity)) continue;
-                    seen.add(row.trackedEntity);
-                    merged.push(row);
+            if (tokenResultMaps.length > 0) {
+                // Walk the smallest map to keep the intersection cheap.
+                const smallest = tokenResultMaps.reduce((acc, m) =>
+                    m.size < acc.size ? m : acc,
+                );
+                for (const [uid, row] of smallest) {
+                    if (tokenResultMaps.every((m) => m.has(uid))) {
+                        merged.push(row);
+                    }
                 }
             }
             merged.sort((a, b) =>
